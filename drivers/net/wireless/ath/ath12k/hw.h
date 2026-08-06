@@ -207,6 +207,15 @@ struct ath12k_hw_params {
 
 	u64 qmi_cnss_feature_bitmap;
 
+	/*
+	 * Send the MLO block in the QMI host capability request even when the
+	 * firmware does not advertise single_chip_mlo_support. Vendor
+	 * WLAN.HMT.2.0 firmware (OnePlus SM8650 phones) requires the block
+	 * but never advertises the bit; downstream cnss2 sends it
+	 * unconditionally for this device family.
+	 */
+	bool qmi_mlo_host_cap:1;
+
 	u32 rfkill_pin;
 	u32 rfkill_cfg;
 	u32 rfkill_on_level;

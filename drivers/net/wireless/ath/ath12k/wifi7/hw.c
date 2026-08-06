@@ -516,6 +516,7 @@ static const struct ath12k_hw_params ath12k_wifi7_hw_params[] = {
 		 * WLAN.HMT.2.0 firmware changes behaviour on it.
 		 */
 		.qmi_cnss_feature_bitmap = BIT(CNSS_PCIE_PERST_NO_PULL_V01),
+		.qmi_mlo_host_cap = true,
 
 		.rfkill_pin = 48,
 		.rfkill_cfg = 0,
