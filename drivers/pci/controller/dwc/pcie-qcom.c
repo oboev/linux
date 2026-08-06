@@ -58,6 +58,7 @@
 #define PARF_LTSSM				0x1b0
 #define PARF_SID_OFFSET				0x234
 #define PARF_BDF_TRANSLATE_CFG			0x24c
+#define PARF_CFG_BITS_3				0x2c4
 #define PARF_DBI_BASE_ADDR_V2			0x350
 #define PARF_DBI_BASE_ADDR_V2_HI		0x354
 #define PARF_SLV_ADDR_SPACE_SIZE_V2		0x358
@@ -133,6 +134,17 @@
 /* PARF_LTSSM register fields */
 #define LTSSM_EN				BIT(8)
 #define PARF_LTSSM_STATE_MASK			GENMASK(5, 0)
+
+#define SM8650_PCIE_CRM_BASE			0x01d01000
+#define SM8650_PCIE_CRM_SIZE			0x3000
+#define SM8650_PCIE_SM_BASE			0x01d07000
+#define SM8650_PCIE_SM_SIZE			0x7000
+
+#define SM8650_CRM_CFG_PARAM_1			0x0004
+#define SM8650_CRM_CFG_PARAM_2			0x0008
+#define SM8650_CRM_ENABLE			0x000c
+#define SM8650_CRM_CHN_BUSY			0x1000
+#define SM8650_CRM_CHN_UPDATE			0x1020
 
 /* PARF_NO_SNOOP_OVERRIDE register fields */
 #define WR_NO_SNOOP_OVERRIDE_EN			BIT(1)
@@ -266,6 +278,8 @@ struct qcom_pcie_cfg {
 	bool override_no_snoop;
 	bool firmware_managed;
 	bool no_l0s;
+	bool sm8650_downstream_init;
+	bool sm8650_wcn_link_retry;
 };
 
 struct qcom_pcie_perst {
@@ -284,6 +298,8 @@ struct qcom_pcie {
 	struct dw_pcie *pci;
 	void __iomem *parf;			/* DT parf */
 	void __iomem *mhi;
+	void __iomem *crm;			/* SM8650 PCIe CRM */
+	void __iomem *pcie_sm;			/* SM8650 CESTA state manager */
 	union qcom_pcie_resources res;
 	struct icc_path *icc_mem;
 	struct icc_path *icc_cpu;
@@ -295,6 +311,121 @@ struct qcom_pcie {
 };
 
 #define to_qcom_pcie(x)		dev_get_drvdata((x)->dev)
+
+static const u32 sm8650_pcie_sm_seq[] = {
+	0x1c018081, 0x70074002, 0x50028000, 0x28007003,
+	0x80804002, 0x70021c01, 0x18001802, 0x70005000,
+	0x10004000, 0x80814002, 0x18001c01, 0x1c018080,
+	0x00000100,
+};
+
+static const u32 sm8650_pcie_sm_branch_seq[] = {
+	0x04, 0x1c, 0x24, 0x2c, 0x00, 0x00, 0x00,
+};
+
+static int qcom_pcie_sm8650_cesta_map(struct qcom_pcie *pcie)
+{
+	struct device *dev = pcie->pci->dev;
+	size_t i;
+
+	pcie->crm = devm_ioremap(dev, SM8650_PCIE_CRM_BASE,
+				  SM8650_PCIE_CRM_SIZE);
+	if (!pcie->crm)
+		return -ENOMEM;
+
+	pcie->pcie_sm = devm_ioremap(dev, SM8650_PCIE_SM_BASE,
+				      SM8650_PCIE_SM_SIZE);
+	if (!pcie->pcie_sm)
+		return -ENOMEM;
+
+	/* Clear downstream's boot-argument overrides for PCIe instance 0. */
+	writel(0, pcie->pcie_sm + 0x1040);
+	writel(0, pcie->pcie_sm + 0x1048);
+
+	for (i = 0; i < ARRAY_SIZE(sm8650_pcie_sm_seq); i++)
+		writel(sm8650_pcie_sm_seq[i], pcie->pcie_sm + 4 * i);
+
+	for (i = 0; i < ARRAY_SIZE(sm8650_pcie_sm_branch_seq); i++)
+		writel(sm8650_pcie_sm_branch_seq[i],
+		       pcie->pcie_sm + 0x1000 + 4 * i);
+
+	writel(readl(pcie->pcie_sm + 0x1090) | BIT(0),
+	       pcie->pcie_sm + 0x1090);
+	wmb();
+
+	dev_info(dev, "loaded downstream PCIe state-manager sequence\n");
+
+	return 0;
+}
+
+static int qcom_pcie_sm8650_cesta_d0(struct qcom_pcie *pcie)
+{
+	static const u16 perf_pwr_offsets[] = {
+		0x000, 0x040, 0x080, 0x600, 0x640,
+	};
+	static const u16 bw_pwr_offsets[] = {
+		0x0c0, 0x140, 0x680, 0x700, 0x780,
+	};
+	u32 cfg, cfg2, num_perf, num_nodes, num_states;
+	u32 ch_update, ch, offset, val;
+	unsigned int i, resource;
+	int ret;
+
+	if (!pcie->crm || !pcie->pcie_sm)
+		return -ENODEV;
+
+	if (!readl(pcie->crm + SM8650_CRM_ENABLE))
+		return -EIO;
+
+	cfg = readl(pcie->crm + SM8650_CRM_CFG_PARAM_1);
+	cfg2 = readl(pcie->crm + SM8650_CRM_CFG_PARAM_2);
+	num_states = cfg & GENMASK(3, 0);
+	num_perf = FIELD_GET(GENMASK(11, 8), cfg);
+	num_nodes = FIELD_GET(GENMASK(30, 26), cfg2);
+	if (num_states < 2 || num_states > ARRAY_SIZE(perf_pwr_offsets) ||
+	    !num_perf || !num_nodes)
+		return -EINVAL;
+
+	ch_update = readl(pcie->crm + SM8650_CRM_CHN_UPDATE);
+	if (!ch_update)
+		ch = 0;
+	else if (ch_update & BIT(0))
+		ch = 1;
+	else if (ch_update & BIT(1))
+		ch = 0;
+	else
+		return -EBUSY;
+
+	/* Match the zero-initialized downstream CRM cache on the free channel. */
+	for (i = 0; i < num_states; i++) {
+		for (resource = 0; resource < num_perf; resource++) {
+			offset = 0x200 + perf_pwr_offsets[i] +
+				 ch * num_perf * 4 + resource * 4;
+			writel(0, pcie->crm + offset);
+		}
+		for (resource = 0; resource < num_nodes; resource++) {
+			offset = 0x200 + bw_pwr_offsets[i] +
+				 ch * num_nodes * 4 + resource * 4;
+			writel(0, pcie->crm + offset);
+		}
+	}
+
+	/* RC0 D0 maps power states 0 and 1 to Gen3 performance level 4. */
+	writel(4, pcie->crm + 0x200 + ch * num_perf * 4);
+	writel(4, pcie->crm + 0x240 + ch * num_perf * 4);
+	wmb();
+	writel(BIT(ch), pcie->crm + SM8650_CRM_CHN_UPDATE);
+
+	ret = readl_poll_timeout(pcie->crm + SM8650_CRM_CHN_BUSY, val,
+				 (val & BIT(ch)), 100, 10000);
+	if (ret)
+		return ret;
+
+	dev_info(pcie->pci->dev,
+		 "applied downstream PCIe CRM D0 vote on channel %u\n", ch);
+
+	return 0;
+}
 
 static void __qcom_pcie_perst_assert(struct qcom_pcie *pcie, bool assert)
 {
@@ -325,15 +456,43 @@ static void qcom_pcie_perst_deassert(struct qcom_pcie *pcie)
 static int qcom_pcie_start_link(struct dw_pcie *pci)
 {
 	struct qcom_pcie *pcie = to_qcom_pcie(pci);
+	unsigned int retry;
+	int ret;
 
 	qcom_pcie_common_set_equalization(pci);
 
 	if (pcie_get_link_speed(pci->max_link_speed) == PCIE_SPEED_16_0GT)
 		qcom_pcie_common_set_16gt_lane_margining(pci);
 
-	/* Enable Link Training state machine */
-	if (pcie->cfg->ops->ltssm_enable)
-		pcie->cfg->ops->ltssm_enable(pcie);
+	for (retry = 0; ; retry++) {
+		/* Enable Link Training state machine */
+		if (pcie->cfg->ops->ltssm_enable)
+			pcie->cfg->ops->ltssm_enable(pcie);
+
+		if (!pcie->cfg->sm8650_wcn_link_retry)
+			break;
+
+		ret = dw_pcie_wait_for_link(pci);
+		if (!ret || retry == 4)
+			break;
+
+		dev_info(pci->dev,
+			 "WCN link retry %u: power cycling endpoint for %u ms\n",
+			 retry + 1, 500 * (retry + 1));
+
+		/* Stop training and hold the endpoint in reset while it cycles. */
+		writel(readl(pcie->parf + PARF_LTSSM) & ~LTSSM_EN,
+		       pcie->parf + PARF_LTSSM);
+		qcom_pcie_perst_assert(pcie);
+		pci_pwrctrl_power_off_devices(pci->dev);
+		msleep(500 * (retry + 1));
+
+		ret = pci_pwrctrl_power_on_devices(pci->dev);
+		if (ret)
+			return ret;
+
+		qcom_pcie_perst_deassert(pcie);
+	}
 
 	return 0;
 }
@@ -750,6 +909,8 @@ static int qcom_pcie_post_init_2_3_2(struct qcom_pcie *pcie)
 	val = readl(pcie->parf + PARF_SYS_CTRL);
 	val &= ~MAC_PHY_POWERDOWN_IN_P2_D_MUX_EN;
 	writel(val, pcie->parf + PARF_SYS_CTRL);
+	if (pcie->cfg->sm8650_downstream_init)
+		writel(0x365e, pcie->parf + PARF_SYS_CTRL);
 
 	val = readl(pcie->parf + PARF_MHI_CLOCK_RESET_CTRL);
 	val |= BYPASS;
@@ -1014,6 +1175,14 @@ static int qcom_pcie_init_2_7_0(struct qcom_pcie *pcie)
 	if (ret < 0)
 		goto err_disable_regulators;
 
+	if (pcie->cfg->sm8650_downstream_init) {
+		ret = qcom_pcie_sm8650_cesta_d0(pcie);
+		if (ret) {
+			dev_err(dev, "failed to apply PCIe CRM D0 vote: %d\n", ret);
+			goto err_disable_clocks;
+		}
+	}
+
 	ret = reset_control_assert(res->rst);
 	if (ret) {
 		dev_err(dev, "reset assert failed (%d)\n", ret);
@@ -1073,6 +1242,20 @@ err_disable_regulators:
 static int qcom_pcie_post_init_2_7_0(struct qcom_pcie *pcie)
 {
 	const struct qcom_pcie_cfg *pcie_cfg = pcie->cfg;
+	struct dw_pcie *pci = pcie->pci;
+	u32 val;
+
+	if (pcie_cfg->sm8650_downstream_init) {
+		/* Match Qualcomm's downstream SM8650 pre-LTSSM setup. */
+		val = readl(pcie->parf + PARF_CFG_BITS_3);
+		val &= ~BIT(0);
+		val |= BIT(8);
+		writel(val, pcie->parf + PARF_CFG_BITS_3);
+
+		val = readl(pci->dbi_base + 0x714);
+		val |= BIT(5);
+		writel(val, pci->dbi_base + 0x714);
+	}
 
 	if (pcie_cfg->override_no_snoop)
 		writel(WR_NO_SNOOP_OVERRIDE_EN | RD_NO_SNOOP_OVERRIDE_EN,
@@ -1573,6 +1756,12 @@ static const struct qcom_pcie_cfg cfg_1_9_0 = {
 	.ops = &ops_1_9_0,
 };
 
+static const struct qcom_pcie_cfg cfg_sm8650 = {
+	.ops = &ops_1_9_0,
+	.sm8650_downstream_init = true,
+	.sm8650_wcn_link_retry = true,
+};
+
 static const struct qcom_pcie_cfg cfg_1_34_0 = {
 	.ops = &ops_1_9_0,
 	.override_no_snoop = true,
@@ -2065,6 +2254,15 @@ static int qcom_pcie_probe(struct platform_device *pdev)
 		goto err_pm_runtime_put;
 	}
 
+	if (pcie_cfg->sm8650_downstream_init) {
+		ret = qcom_pcie_sm8650_cesta_map(pcie);
+		if (ret) {
+			dev_err_probe(dev, ret,
+				      "Failed to initialize PCIe state manager\n");
+			goto err_pm_runtime_put;
+		}
+	}
+
 	/* MHI region is optional */
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "mhi");
 	if (res) {
@@ -2307,6 +2505,7 @@ static const struct of_device_id qcom_pcie_match[] = {
 	{ .compatible = "qcom,pcie-sm8350", .data = &cfg_1_9_0 },
 	{ .compatible = "qcom,pcie-sm8450-pcie0", .data = &cfg_1_9_0 },
 	{ .compatible = "qcom,pcie-sm8450-pcie1", .data = &cfg_1_9_0 },
+	{ .compatible = "qcom,pcie-sm8650", .data = &cfg_sm8650 },
 	{ .compatible = "qcom,pcie-sm8550", .data = &cfg_1_9_0 },
 	{ .compatible = "qcom,pcie-x1e80100", .data = &cfg_sc8280xp },
 	{ }
