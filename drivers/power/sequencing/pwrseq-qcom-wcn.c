@@ -14,6 +14,7 @@
 #include <linux/property.h>
 #include <linux/regulator/consumer.h>
 #include <linux/pwrseq/provider.h>
+#include <linux/soc/qcom/qcom_aoss.h>
 #include <linux/string.h>
 #include <linux/types.h>
 
@@ -22,6 +23,7 @@ struct pwrseq_qcom_wcn_pdata {
 	size_t num_vregs;
 	unsigned int pwup_delay_ms;
 	unsigned int gpio_enable_delay_ms;
+	bool wlan_reset_pulse;
 	const struct pwrseq_target_data **targets;
 	bool has_vddio; /* separate VDD IO regulator */
 	int (*match)(struct pwrseq_device *pwrseq, struct device *dev);
@@ -37,8 +39,59 @@ struct pwrseq_qcom_wcn_ctx {
 	struct gpio_desc *wlan_gpio;
 	struct gpio_desc *xo_clk_gpio;
 	struct clk *clk;
+	struct qmp *qmp;
 	unsigned long last_gpio_enable_jf;
 };
+
+static void pwrseq_qcom_wcn_qmp_put(void *data)
+{
+	qmp_put(data);
+}
+
+static int pwrseq_qcom_wcn_configure_pdc(struct device *dev,
+					struct pwrseq_qcom_wcn_ctx *ctx)
+{
+	const char *property = "qcom,pdc-init-table";
+	const char **messages;
+	int count, i, ret;
+
+	if (!device_property_present(dev, property))
+		return 0;
+
+	count = device_property_string_array_count(dev, property);
+	if (count < 0)
+		return dev_err_probe(dev, count,
+				     "Failed to count WLAN PDC messages\n");
+
+	messages = devm_kcalloc(dev, count, sizeof(*messages), GFP_KERNEL);
+	if (!messages)
+		return -ENOMEM;
+
+	ret = device_property_read_string_array(dev, property, messages, count);
+	if (ret < 0)
+		return dev_err_probe(dev, ret,
+				     "Failed to read WLAN PDC messages\n");
+
+	ctx->qmp = qmp_get(dev);
+	if (IS_ERR(ctx->qmp))
+		return dev_err_probe(dev, PTR_ERR(ctx->qmp),
+				     "Failed to get the AOP QMP channel\n");
+
+	ret = devm_add_action_or_reset(dev, pwrseq_qcom_wcn_qmp_put, ctx->qmp);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < count; i++) {
+		ret = qmp_send(ctx->qmp, "%s", messages[i]);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "WLAN PDC message %d failed\n", i);
+	}
+
+	dev_info(dev, "configured AOP WLAN PDC (%d messages)\n", count);
+
+	return 0;
+}
 
 static void pwrseq_qcom_wcn_ensure_gpio_delay(struct pwrseq_qcom_wcn_ctx *ctx)
 {
@@ -202,6 +255,18 @@ static int pwrseq_qcom_wcn_wlan_enable(struct pwrseq_device *pwrseq)
 	struct pwrseq_qcom_wcn_ctx *ctx = pwrseq_device_get_drvdata(pwrseq);
 
 	pwrseq_qcom_wcn_ensure_gpio_delay(ctx);
+
+	/*
+	 * Qualcomm's downstream KIWI sequence explicitly drives WLAN_EN low
+	 * for 4-5 ms after enabling the input rails and reference clock.  The
+	 * generic upstream path normally preserves the bootloader's level, so
+	 * reproduce that reset pulse for WCN7850 before asserting WLAN_EN.
+	 */
+	if (ctx->pdata->wlan_reset_pulse) {
+		gpiod_set_value_cansleep(ctx->wlan_gpio, 0);
+		usleep_range(4000, 5000);
+	}
+
 	gpiod_set_value_cansleep(ctx->wlan_gpio, 1);
 	ctx->last_gpio_enable_jf = jiffies;
 
@@ -398,6 +463,7 @@ static const struct pwrseq_qcom_wcn_pdata pwrseq_wcn7850_of_data = {
 	.vregs = pwrseq_wcn7850_vregs,
 	.num_vregs = ARRAY_SIZE(pwrseq_wcn7850_vregs),
 	.pwup_delay_ms = 50,
+	.wlan_reset_pulse = true,
 	.targets = pwrseq_qcom_wcn_targets,
 };
 
@@ -526,6 +592,10 @@ static int pwrseq_qcom_wcn_probe(struct platform_device *pdev)
 	if (IS_ERR(ctx->clk))
 		return dev_err_probe(dev, PTR_ERR(ctx->clk),
 				     "Failed to get the reference clock\n");
+
+	ret = pwrseq_qcom_wcn_configure_pdc(dev, ctx);
+	if (ret)
+		return ret;
 
 	memset(&config, 0, sizeof(config));
 
