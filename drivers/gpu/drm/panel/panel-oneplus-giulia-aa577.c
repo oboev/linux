@@ -1179,16 +1179,28 @@ static int aa577_unprepare(struct drm_panel *panel)
 }
 
 /*
- * h: 1264 + 26 front + 2 pulse + 26 back = 1318
- * v: 2780 + 58 front + 2 pulse + 42 back = 2882
- * Porches are identical for all four downstream modes.
+ * v: 2780 + 58 front + 2 pulse + 42 back = 2882, the downstream timing.
+ *
+ * The horizontal overhead is not the downstream 26/2/26. On this
+ * command-mode panel the h "porches" exist only to feed the DSI clock
+ * derivation: dsi_host scales the mode clock by compressed htotal
+ * (ceil(1264 * 8 / 30) = 338, plus the porches) over htotal, then by
+ * bpp over lanes. The front porch is inflated so that math lands on
+ * the vendor's link rate - qcom,mdss-dsi-panel-clockrate is
+ * 1012000000 in all four downstream modes - giving a 126.58 MHz byte
+ * clock. With the downstream porches the link ran at 813 Mbps/lane: a
+ * full compressed frame took ~8.6 ms against the panel's 8.33 ms
+ * self-refresh scan, the read pointer lapped the write inside the
+ * panel's GRAM, and moving content showed bands of misdecoded DSC
+ * slices while the flip rate halved to 60 fps. The clock keeps
+ * vrefresh at exactly 120, which tearcheck programming depends on.
  */
 static const struct drm_display_mode aa577_mode_120 = {
-	.clock = (1318 * 2882 * 120) / 1000,
+	.clock = (1414 * 2882 * 120) / 1000,
 	.hdisplay = 1264,
-	.hsync_start = 1264 + 26,
-	.hsync_end = 1264 + 26 + 2,
-	.htotal = 1264 + 26 + 2 + 26,
+	.hsync_start = 1264 + 122,
+	.hsync_end = 1264 + 122 + 2,
+	.htotal = 1264 + 122 + 2 + 26,
 	.vdisplay = 2780,
 	.vsync_start = 2780 + 58,
 	.vsync_end = 2780 + 58 + 2,
