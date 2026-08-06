@@ -36,6 +36,7 @@ enum bq27xxx_chip {
 	BQ28Z610,
 	BQ34Z100,
 	BQ78Z100,
+	NFG8011B, /* bq27541 command set, but NAC and CYCT are not populated */
 };
 
 struct bq27xxx_device_info;

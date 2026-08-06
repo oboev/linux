@@ -50,6 +50,9 @@ properties:
       - ti,bq28z610
       - ti,bq34z100
       - ti,bq78z100
+      # not a TI part: bq27541-compatible command set, NAC/CYCT unpopulated;
+      # the manufacturer is unidentified and the prefix is provisional
+      - oneplus,nfg8011b
 
   reg:
     maxItems: 1
