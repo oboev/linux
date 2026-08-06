@@ -813,8 +813,12 @@
 
 	status = "okay";
 
+	/*
+	 * An NFG8011B, not the bq27541 the vendor node claims — it answers
+	 * device type 0x4231 and leaves NAC/CYCT unpopulated.
+	 */
 	fuel_gauge: battery@55 {
-		compatible = "ti,bq27541";
+		compatible = "oneplus,nfg8011b";
 		reg = <0x55>;
 	};
 };
