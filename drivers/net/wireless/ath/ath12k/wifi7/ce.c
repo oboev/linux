@@ -422,7 +422,8 @@ const struct ce_pipe_config ath12k_wifi7_target_ce_config_wlan_wcn7850[] = {
 		.pipenum = __cpu_to_le32(2),
 		.pipedir = __cpu_to_le32(PIPEDIR_IN),
 		.nentries = __cpu_to_le32(32),
-		.nbytes_max = __cpu_to_le32(2048),
+		/* downstream kiwi sizes the WMI pipes at 3520, not 2048 */
+		.nbytes_max = __cpu_to_le32(3520),
 		.flags = __cpu_to_le32(CE_ATTR_FLAGS),
 		.reserved = __cpu_to_le32(0),
 	},
@@ -432,7 +433,8 @@ const struct ce_pipe_config ath12k_wifi7_target_ce_config_wlan_wcn7850[] = {
 		.pipenum = __cpu_to_le32(3),
 		.pipedir = __cpu_to_le32(PIPEDIR_OUT),
 		.nentries = __cpu_to_le32(32),
-		.nbytes_max = __cpu_to_le32(2048),
+		/* downstream kiwi sizes the WMI pipes at 3520, not 2048 */
+		.nbytes_max = __cpu_to_le32(3520),
 		.flags = __cpu_to_le32(CE_ATTR_FLAGS),
 		.reserved = __cpu_to_le32(0),
 	},
@@ -593,8 +595,9 @@ const struct ce_attr ath12k_wifi7_host_ce_config_wcn7850[] = {
 	{
 		.flags = CE_ATTR_FLAGS,
 		.src_nentries = 0,
-		.src_sz_max = 2048,
-		.dest_nentries = 64,
+		/* match downstream kiwi: 3520-byte WMI messages, 256-deep ring */
+		.src_sz_max = 3520,
+		.dest_nentries = 256,
 		.recv_cb = ath12k_htc_rx_completion_handler,
 	},
 
@@ -602,7 +605,8 @@ const struct ce_attr ath12k_wifi7_host_ce_config_wcn7850[] = {
 	{
 		.flags = CE_ATTR_FLAGS,
 		.src_nentries = 32,
-		.src_sz_max = 2048,
+		/* match downstream kiwi */
+		.src_sz_max = 3520,
 		.dest_nentries = 0,
 	},
 

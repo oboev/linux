@@ -61,9 +61,18 @@ void ath12k_wifi7_wmi_init_qcn9274(struct ath12k_base *ab,
 void ath12k_wifi7_wmi_init_wcn7850(struct ath12k_base *ab,
 				   struct ath12k_wmi_resource_config_arg *config)
 {
-	config->num_vdevs = 4;
-	config->num_peers = 16;
-	config->num_tids = 32;
+	/*
+	 * Downstream computes these for this device rather than hardcoding
+	 * them: num_vdevs comes from gNumVdevs=5, and
+	 *   num_peers = no_of_peers_supported + num_vdevs + 2
+	 *   num_tids  = 2 * (no_of_peers_supported + num_vdevs + 2)
+	 * with no_of_peers_supported = 10 (gSoftApMaxPeers). Upstream's 16/32
+	 * are that same formula evaluated at num_vdevs = 4. Move the whole
+	 * triple together; the three are not independent.
+	 */
+	config->num_vdevs = 5;
+	config->num_peers = 17;
+	config->num_tids = 34;
 
 	config->num_offload_peers = 3;
 	config->num_offload_reorder_buffs = 3;

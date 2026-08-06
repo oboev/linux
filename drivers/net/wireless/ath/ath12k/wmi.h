@@ -2644,6 +2644,21 @@ struct ath12k_wmi_resource_config_params {
 	__le32 max_rnr_neighbours;
 	__le32 ema_max_vap_cnt;
 	__le32 ema_max_profile_period;
+	__le32 max_ndp_sessions;
+	__le32 max_ndi_interfaces;
+	__le32 max_ap_vaps;
+	__le32 cbc_flow_ena;
+	__le32 ema_init_config;
+	__le32 carrier_config;
+	__le32 num_of_linkview_peers;
+	__le32 num_of_linkview_msduqs_per_tid;
+	__le32 num_max_active_vdevs;
+	__le32 num_max_mlo_link_per_ml_bss;
+	__le32 num_max_active_mlo_link_per_ml_bss;
+	__le32 c2c_int_type_config;
+	__le32 apf_data_ofload_enable;
+	__le32 dp_haps_config;
+	__le32 nan_config_word;
 } __packed;
 
 struct wmi_service_ready_event {
@@ -5384,6 +5399,7 @@ struct ath12k_wmi_base {
 	u32 num_mem_chunks;
 	u32 rx_decap_mode;
 	struct ath12k_wmi_host_mem_chunk_arg mem_chunks[WMI_MAX_MEM_REQS];
+	struct ath12k_wmi_abi_version_params fw_abi_vers;
 
 	enum wmi_host_hw_mode_config_type preferred_hw_mode;
 

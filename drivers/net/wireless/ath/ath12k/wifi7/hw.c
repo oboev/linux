@@ -460,7 +460,15 @@ static const struct ath12k_hw_params ath12k_wifi7_hw_params[] = {
 		.max_radios = 1,
 		.single_pdev_only = true,
 		.qmi_service_ins_id = ATH12K_QMI_WLFW_SERVICE_INS_ID_V01_WCN7850,
-		.internal_sleep_clock = true,
+		/*
+		 * This flag is only read by the host-capability request, where
+		 * it makes the host declare a non-Qualcomm platform running on
+		 * an internal sleep clock. That is true of the M.2 modules this
+		 * target was brought up on and false on Qualcomm phones: the SoC
+		 * supplies the reference clock (wcn7850-pmu takes RPMH_RF_CLK1),
+		 * and downstream cnss2 sends nm_modem_valid = 0 on kiwi phones.
+		 */
+		.internal_sleep_clock = false,
 
 		.hw_ops = &wcn7850_ops,
 		.ring_mask = &ath12k_wifi7_hw_ring_mask_wcn7850,

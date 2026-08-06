@@ -646,6 +646,9 @@ static int ath12k_pull_service_ready_tlv(struct ath12k_base *ab,
 		return -EINVAL;
 	}
 
+	/* Kept for the WMI_INIT ABI echo, which downstream hosts perform. */
+	ab->wmi_ab.fw_abi_vers = ev->fw_abi_vers;
+
 	cap->phy_capability = le32_to_cpu(ev->phy_capability);
 	cap->max_frag_entry = le32_to_cpu(ev->max_frag_entry);
 	cap->num_rf_chains = le32_to_cpu(ev->num_rf_chains);
@@ -4176,9 +4179,11 @@ ath12k_wmi_copy_resource_config(struct ath12k_base *ab,
 	wmi_cfg->bpf_instruction_size = cpu_to_le32(tg_cfg->bpf_instruction_size);
 	wmi_cfg->max_bssid_rx_filters = cpu_to_le32(tg_cfg->max_bssid_rx_filters);
 	wmi_cfg->use_pdev_id = cpu_to_le32(tg_cfg->use_pdev_id);
-	wmi_cfg->flag1 = cpu_to_le32(tg_cfg->atf_config |
-				     WMI_RSRC_CFG_FLAG1_BSS_CHANNEL_INFO_64 |
-				     WMI_RSRC_CFG_FLAG1_ACK_RSSI);
+	/*
+	 * The OnePlus HMT 2.0 downstream host does not request the upstream
+	 * BSS_CHANNEL_INFO_64 or ACK_RSSI resource capabilities.
+	 */
+	wmi_cfg->flag1 = cpu_to_le32(tg_cfg->atf_config);
 	wmi_cfg->peer_map_unmap_version = cpu_to_le32(tg_cfg->peer_map_unmap_version);
 	wmi_cfg->sched_params = cpu_to_le32(tg_cfg->sched_params);
 	wmi_cfg->twt_ap_pdev_count = cpu_to_le32(tg_cfg->twt_ap_pdev_count);
@@ -4192,9 +4197,6 @@ ath12k_wmi_copy_resource_config(struct ath12k_base *ab,
 			cpu_to_le32(1 << WMI_RSRC_CFG_HOST_SVC_FLAG_REO_QREF_SUPPORT_BIT);
 	wmi_cfg->ema_max_vap_cnt = cpu_to_le32(tg_cfg->ema_max_vap_cnt);
 	wmi_cfg->ema_max_profile_period = cpu_to_le32(tg_cfg->ema_max_profile_period);
-	wmi_cfg->flags2 |= cpu_to_le32(WMI_RSRC_CFG_FLAGS2_CALC_NEXT_DTIM_COUNT_SET |
-				       WMI_RSRC_CFG_FLAGS2_FW_AST_INDICATION_DISABLE);
-
 	if (tg_cfg->is_wds_null_frame_supported)
 		wmi_cfg->flags2 |=
 			cpu_to_le32(WMI_RSRC_CFG_FLAGS2_WDS_NULL_FRAME_SUPPORT);
@@ -4231,6 +4233,12 @@ static int ath12k_init_cmd_send(struct ath12k_wmi_pdev *wmi,
 
 	cmd->tlv_header = ath12k_wmi_tlv_cmd_hdr(WMI_TAG_INIT_CMD,
 						 sizeof(*cmd));
+	/*
+	 * Echo the firmware's ABI tuple from service-ready, as downstream
+	 * hosts do, with the OnePlus downstream host ABI revision.
+	 */
+	cmd->host_abi_vers = ab->wmi_ab.fw_abi_vers;
+	cmd->host_abi_vers.abi_version_1 = cpu_to_le32(1681);
 
 	ptr = skb->data + sizeof(*cmd);
 	cfg = ptr;

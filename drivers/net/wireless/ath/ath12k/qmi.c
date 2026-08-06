@@ -2219,7 +2219,14 @@ int ath12k_qmi_host_cap_send(struct ath12k_base *ab)
 	}
 
 	req.cal_done_valid = 1;
-	req.cal_done = ab->qmi.cal_done;
+	/*
+	 * ab->qmi.cal_done is never assigned anywhere in ath12k, so this
+	 * always went out as 0. Downstream cnss2 on this board runs cold-boot
+	 * calibration before mission mode ("qcom,wlan-cbc-enabled" in the
+	 * Android DT), so the firmware has only ever seen cal_done = 1 from
+	 * the vendor stack. Match that contract.
+	 */
+	req.cal_done = 1;
 
 	if (ab->hw_params->qmi_cnss_feature_bitmap) {
 		req.feature_list_valid = 1;
