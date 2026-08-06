@@ -23,6 +23,7 @@
 #include <linux/interrupt.h>
 #include <linux/smp.h>
 #include <linux/fs.h>
+#include <linux/font.h>
 #include <linux/panic_notifier.h>
 #include <linux/proc_fs.h>
 #include <linux/memblock.h>
@@ -166,6 +167,132 @@ static void __init smp_build_mpidr_hash(void)
 	if (mpidr_hash_size() > 4 * num_possible_cpus())
 		pr_warn("Large number of MPIDR hash buckets detected\n");
 }
+
+/*
+ * Framebuffer console for giulia (OnePlus 13R).
+ *
+ * This board has no UART we can reach, and every in-tree console driver binds
+ * far too late to be useful: simpledrm and fbcon are device_initcalls. This
+ * renders printk straight to the framebuffer the bootloader leaves running
+ * (0xd5100000, 1264x2780, x8r8g8b8), from console_init() onwards, which is the
+ * only way to see an oops on this hardware.
+ *
+ * font_vga_8x16 is linked in via CONFIG_FONT_8x16. At scale 2 the panel gives
+ * 79 columns, which fits an arm64 oops without folding lines.
+ */
+#define CON_W		1264
+#define CON_SCALE	2
+#define CON_CW		(8 * CON_SCALE)
+#define CON_CH		(16 * CON_SCALE)
+#define CON_COLS	(CON_W / CON_CW)	/* 79 */
+#define CON_ROWS	76			/* 76 * 32 = 2432 */
+
+static void __iomem *giulia_con_fb;
+static int giulia_con_col, giulia_con_row;
+
+static void giulia_con_clear_row(int row)
+{
+	int x, y;
+
+	for (y = row * CON_CH; y < (row + 1) * CON_CH; y++)
+		for (x = 0; x < CON_W; x++)
+			writel(0, giulia_con_fb + ((y * CON_W) + x) * 4);
+}
+
+static void giulia_con_glyph(int col, int row, unsigned char ch)
+{
+	const unsigned char *g = (const unsigned char *)font_vga_8x16.data
+				 + ch * 16;
+	int gx, gy, sx, sy;
+
+	for (gy = 0; gy < 16; gy++) {
+		unsigned char bits = g[gy];
+
+		for (gx = 0; gx < 8; gx++) {
+			u32 v = (bits & (0x80 >> gx)) ? 0x00ffffff : 0;
+
+			for (sy = 0; sy < CON_SCALE; sy++)
+				for (sx = 0; sx < CON_SCALE; sx++) {
+					int px = col * CON_CW + gx * CON_SCALE + sx;
+					int py = row * CON_CH + gy * CON_SCALE + sy;
+
+					writel(v, giulia_con_fb +
+						  ((py * CON_W) + px) * 4);
+				}
+		}
+	}
+}
+
+/*
+ * Wrap to the top rather than scroll. Scrolling would mean reading back
+ * ~12 MiB of framebuffer per line, and the last CON_ROWS lines are exactly
+ * what we want anyway — the oops plus the messages leading into it. The
+ * blank row kept ahead of the cursor marks where the newest text ends.
+ */
+static void giulia_con_newline(void)
+{
+	giulia_con_col = 0;
+	if (++giulia_con_row >= CON_ROWS)
+		giulia_con_row = 0;
+	giulia_con_clear_row(giulia_con_row);
+	giulia_con_clear_row((giulia_con_row + 1) % CON_ROWS);
+}
+
+static void giulia_con_write(struct console *co, const char *s, unsigned int n)
+{
+	if (!giulia_con_fb)
+		return;
+
+	while (n--) {
+		char c = *s++;
+
+		if (c == '\n') {
+			giulia_con_newline();
+			continue;
+		}
+		if (c == '\r' || c == '\0')
+			continue;
+		if (c == '\t')
+			c = ' ';
+		if (giulia_con_col >= CON_COLS)
+			giulia_con_newline();
+		giulia_con_glyph(giulia_con_col++, giulia_con_row,
+				 (unsigned char)c);
+	}
+}
+
+static struct console giulia_console = {
+	.name	= "giuliafb",
+	.write	= giulia_con_write,
+	.flags	= CON_PRINTBUFFER | CON_ENABLED | CON_ANYTIME,
+	.index	= -1,
+};
+
+
+static int __init giulia_con_init(void)
+{
+	int r;
+
+	/*
+	 * Write-combining, not plain ioremap(): Device-nGnRE would make every
+	 * one of the 512 writel()s per glyph a strongly-ordered bus
+	 * transaction. Normal-NC is both correct for a framebuffer and around
+	 * an order of magnitude faster.
+	 */
+	giulia_con_fb = ioremap_wc(0xd5100000,
+				   (phys_addr_t)CON_W * CON_ROWS * CON_CH * 4);
+	if (!giulia_con_fb)
+		return -ENOMEM;
+
+	for (r = 0; r < CON_ROWS; r++)
+		giulia_con_clear_row(r);
+
+	register_console(&giulia_console);
+	return 0;
+}
+console_initcall(giulia_con_init);
+
+
 
 static void __init setup_machine_fdt(phys_addr_t dt_phys)
 {
