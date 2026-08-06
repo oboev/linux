@@ -542,6 +542,44 @@ struct qmi_wlanfw_m3_info_resp_msg_v01 {
 	struct qmi_response_type_v01 resp;
 };
 
+/*
+ * The QDSS trace configuration download.
+ *
+ * Upstream has no QDSS support and declares QDSS_CFG_MISS in feature_list to
+ * say so. The OnePlus WLAN.HMT.2.0 firmware reacts to that declaration; with
+ * the bit cleared it waits for this download before emitting FW_READY, and
+ * downstream pushes the file unprompted after the BDF and aux downloads.
+ *
+ * The message ID and the element layout are read out of the shipping vendor
+ * modules, not guessed: 0x0044 from the qmi_send_request call site in
+ * cnss2.ko, and the TLV types, offsets and sizes from
+ * wlfw_qdss_trace_config_download_req_msg_v01_ei in wlan_firmware_service.ko.
+ * The struct mirrors the BDF download's convention of a u32 data_len field
+ * carried on the wire as u16.
+ */
+#define ATH12K_QMI_QDSS_CONFIG_FILE			"qdss_trace_config_v2.cfg"
+
+#define QMI_WLANFW_QDSS_TRACE_CONFIG_DOWNLOAD_REQ_MSG_V01_MAX_LEN	6167
+#define QMI_WLANFW_QDSS_TRACE_CONFIG_DOWNLOAD_RESP_MSG_V01_MAX_LEN	7
+#define QMI_WLANFW_QDSS_TRACE_CONFIG_DOWNLOAD_REQ_V01			0x0044
+#define QMI_WLANFW_QDSS_TRACE_CONFIG_DOWNLOAD_RESP_V01			0x0044
+
+struct qmi_wlanfw_qdss_trace_config_download_req_msg_v01 {
+	u8 total_size_valid;
+	u32 total_size;
+	u8 seg_id_valid;
+	u32 seg_id;
+	u8 data_valid;
+	u32 data_len;
+	u8 data[QMI_WLANFW_MAX_DATA_SIZE_V01];
+	u8 end_valid;
+	u8 end;
+};
+
+struct qmi_wlanfw_qdss_trace_config_download_resp_msg_v01 {
+	struct qmi_response_type_v01 resp;
+};
+
 #define QMI_WLANFW_AUX_UC_INFO_REQ_MSG_V01_MAX_MSG_LEN	18
 #define QMI_WLANFW_AUX_UC_INFO_RESP_MSG_V01_MAX_MSG_LEN	7
 #define QMI_WLANFW_AUX_UC_INFO_REQ_V01	0x005A

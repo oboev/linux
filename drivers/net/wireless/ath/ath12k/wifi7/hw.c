@@ -508,8 +508,14 @@ static const struct ath12k_hw_params ath12k_wifi7_hw_params[] = {
 
 		.wmi_init = ath12k_wifi7_wmi_init_wcn7850,
 
-		.qmi_cnss_feature_bitmap = BIT(CNSS_QDSS_CFG_MISS_V01) |
-					   BIT(CNSS_PCIE_PERST_NO_PULL_V01),
+		/*
+		 * QDSS_CFG_MISS tells the firmware the host has no QDSS trace
+		 * configuration. This driver now downloads the vendor's
+		 * configuration (see ath12k_qmi_wlanfw_qdss_dnld_send_sync),
+		 * so the bit is cleared, matching downstream cnss2 - the OnePlus
+		 * WLAN.HMT.2.0 firmware changes behaviour on it.
+		 */
+		.qmi_cnss_feature_bitmap = BIT(CNSS_PCIE_PERST_NO_PULL_V01),
 
 		.rfkill_pin = 48,
 		.rfkill_cfg = 0,
