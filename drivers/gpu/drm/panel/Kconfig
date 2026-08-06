@@ -687,6 +687,17 @@ config DRM_PANEL_OLIMEX_LCD_OLINUXINO
 	  Say Y here if you want to enable support for Olimex Ltd.
 	  LCD-OLinuXino panel.
 
+config DRM_PANEL_ONEPLUS_GIULIA_AA577
+	tristate "OnePlus 13R (giulia) BOE AA577 DSI panel"
+	depends on OF
+	depends on DRM_MIPI_DSI
+	depends on BACKLIGHT_CLASS_DEVICE
+	select DRM_DISPLAY_HELPER
+	select DRM_DISPLAY_DP_HELPER
+	help
+	  Say Y here if you want to enable support for the BOE AA577
+	  1264x2780 DSC command-mode AMOLED panel found in the OnePlus 13R.
+
 config DRM_PANEL_ORISETECH_OTA5601A
         tristate "Orise Technology ota5601a RGB/SPI panel"
         depends on SPI
