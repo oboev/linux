@@ -70,6 +70,55 @@
 		serial0 = &uart15;
 	};
 
+	/*
+	 * WCD9395 audio codec - headset path only. It carries the headphone
+	 * amplifier, the analog mics and the MBHC block; the loudspeakers are
+	 * NOT on it (see the sound node).
+	 *
+	 * Reset gpio107 and the supply map are downstream's
+	 * (giulia-23851-audio-pineapple-overlay.dtsi, pineapple-audio-overlay.dtsi
+	 * wcd939x_codec): vdd-rx/tx/buck on L15B, mic bias on BOB1, px on L3C.
+	 * MBHC thresholds are deliberately omitted - optional in the binding, and
+	 * this handset has no 3.5 mm jack, so detection runs over the USB-C
+	 * analog path through the USBSS mux on &i2c3.
+	 */
+	wcd939x: audio-codec {
+		compatible = "qcom,wcd9395-codec", "qcom,wcd9390-codec";
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&wcd_default>;
+
+		qcom,micbias1-microvolt = <1800000>;
+		qcom,micbias2-microvolt = <1800000>;
+		qcom,micbias3-microvolt = <1800000>;
+		qcom,micbias4-microvolt = <1800000>;
+
+		qcom,rx-device = <&wcd_rx>;
+		qcom,tx-device = <&wcd_tx>;
+
+		reset-gpios = <&tlmm 107 GPIO_ACTIVE_LOW>;
+
+		vdd-buck-supply = <&vreg_l15b_1p8>;
+		vdd-rxtx-supply = <&vreg_l15b_1p8>;
+		vdd-io-supply = <&vreg_l15b_1p8>;
+		vdd-mic-bias-supply = <&vreg_bob1>;
+		vdd-px-supply = <&vreg_l3c_1p2>;
+
+		#sound-dai-cells = <1>;
+
+		/*
+		 * Without this graph the codec never runs in typec mode: it
+		 * registers no typec mux, the USBSS has nothing to forward
+		 * plug/orientation events to, so headset insertion is never
+		 * reported to MBHC and ground/mic never swap with orientation.
+		 */
+		port {
+			wcd_codec_headset_in: endpoint {
+				remote-endpoint = <&wcd_usbss_headset_out>;
+			};
+		};
+	};
+
 	chosen {
 		#address-cells = <2>;
 		#size-cells = <2>;
@@ -224,15 +273,87 @@
 						remote-endpoint = <&usb_dp_qmpphy_out>;
 					};
 				};
+
+				/*
+				 * SBU: the analog headset path. This handset has
+				 * no 3.5 mm jack, so headphone audio only reaches
+				 * a plug through the WCD9395 USBSS mux.
+				 */
+				port@2 {
+					reg = <2>;
+
+					pmic_glink_sbu: endpoint {
+						remote-endpoint = <&wcd_usbss_sbu_mux>;
+					};
+				};
 			};
 		};
 	};
 
 	/*
-	 * MTP's sound node targets WSA8845 speakers; giulia
-	 * has WSA884x plus a wcd939x codec and sia91xx amps. Needs its own
-	 * node - deliberately omitted rather than carried over wrong.
+	 * Headset audio only - the loudspeakers are deliberately absent.
+	 *
+	 * Downstream sets qcom,wsa-max-devs = <0> on this board: the WSA884x
+	 * slaves that appear on wsa_swr_master come from the SoC dtsi and are
+	 * not populated here. giulia's speakers are two Si-in sia9177 smart
+	 * amplifiers on i2c7 (0x6c/0x6d, reset gpio173/gpio178) fed from
+	 * secondary MI2S, and sia91xx has no upstream driver, so no WSA or
+	 * MI2S DAI link is claimed until one exists.
 	 */
+	sound {
+		compatible = "qcom,sm8650-sndcard", "qcom,sm8450-sndcard";
+		model = "OnePlus 13R";
+
+		/*
+		 * Analog mic to mic-bias mapping is downstream's
+		 * (giulia-23851-audio-pineapple-overlay.dtsi qcom,audio-routing);
+		 * it differs from the reference boards - AMIC3 is on BIAS4 and
+		 * AMIC5 shares BIAS1.
+		 */
+		audio-routing = "IN1_HPHL", "HPHL_OUT",
+				"IN2_HPHR", "HPHR_OUT",
+				"AMIC1", "MIC BIAS1",
+				"AMIC2", "MIC BIAS2",
+				"AMIC3", "MIC BIAS4",
+				"AMIC4", "MIC BIAS3",
+				"AMIC5", "MIC BIAS1",
+				"TX SWR_INPUT0", "ADC1_OUTPUT",
+				"TX SWR_INPUT1", "ADC2_OUTPUT",
+				"TX SWR_INPUT2", "ADC3_OUTPUT",
+				"TX SWR_INPUT3", "ADC4_OUTPUT";
+
+		wcd-playback-dai-link {
+			link-name = "WCD Playback";
+
+			cpu {
+				sound-dai = <&q6apmbedai RX_CODEC_DMA_RX_0>;
+			};
+
+			codec {
+				sound-dai = <&wcd939x 0>, <&swr1 0>, <&lpass_rxmacro 0>;
+			};
+
+			platform {
+				sound-dai = <&q6apm>;
+			};
+		};
+
+		wcd-capture-dai-link {
+			link-name = "WCD Capture";
+
+			cpu {
+				sound-dai = <&q6apmbedai TX_CODEC_DMA_TX_3>;
+			};
+
+			codec {
+				sound-dai = <&wcd939x 1>, <&swr2 0>, <&lpass_txmacro 0>;
+			};
+
+			platform {
+				sound-dai = <&q6apm>;
+			};
+		};
+	};
 
 	vph_pwr: vph-pwr-regulator {
 		compatible = "regulator-fixed";
@@ -797,6 +918,46 @@
 	firmware-name = "qcom/sm8650/oneplus/giulia/gen70900_zap.mbn";
 };
 
+&i2c3 {
+	status = "okay";
+
+	/*
+	 * WCD9395 USBSS - the analog audio mux on the USB-C SBU lines.
+	 * Downstream has it here as wcd939x_i2c@e on i2c@a8c000, with no
+	 * reset gpio (optional in the driver).
+	 */
+	wcd_usbss: typec-mux@e {
+		compatible = "qcom,wcd9395-usbss", "qcom,wcd9390-usbss";
+		reg = <0xe>;
+
+		vdd-supply = <&vreg_l15b_1p8>;
+
+		mode-switch;
+		orientation-switch;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+
+				wcd_usbss_sbu_mux: endpoint {
+					remote-endpoint = <&pmic_glink_sbu>;
+				};
+			};
+
+			port@1 {
+				reg = <1>;
+
+				wcd_usbss_headset_out: endpoint {
+					remote-endpoint = <&wcd_codec_headset_in>;
+				};
+			};
+		};
+	};
+};
+
 /*
  * i2c8 to reach the fuel gauge at 0x55.
  *
@@ -1243,6 +1404,30 @@
  * SoundWire speakers. giulia has WSA884x
  */
 
+&swr1 {
+	status = "okay";
+
+	/* WCD9395 RX - port mapping is the part's, not the board's */
+	wcd_rx: codec@0,4 {
+		compatible = "sdw20217010e00";
+		reg = <0 4>;
+
+		qcom,rx-port-mapping = <1 2 3 4 5 9>;
+	};
+};
+
+&swr2 {
+	status = "okay";
+
+	/* WCD9395 TX */
+	wcd_tx: codec@0,3 {
+		compatible = "sdw20217010e00";
+		reg = <0 3>;
+
+		qcom,tx-port-mapping = <2 2 3 4>;
+	};
+};
+
 &tlmm {
 	/* Reserved I/Os for NFC */
 	gpio-reserved-ranges = <32 8>, <74 1>;
@@ -1299,6 +1484,15 @@
 		drive-strength = <2>;
 		bias-disable;
 		output-high;
+	};
+
+	/* WCD9395 reset - gpio107, drive strength from downstream's active state */
+	wcd_default: wcd-reset-n-active-state {
+		pins = "gpio107";
+		function = "gpio";
+		drive-strength = <6>;
+		bias-disable;
+		output-low;
 	};
 
 	/* WCN7850 WLAN enable - gpio16 confirmed against the Android snapshot */
