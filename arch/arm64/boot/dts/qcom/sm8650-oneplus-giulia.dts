@@ -205,6 +205,28 @@
 		      <0x9 0x80000000 0x1 0x80000000>;
 	};
 
+	/*
+	 * Volume DOWN. The same pm8550 gpio6 button the HDK maps as volume up:
+	 * on this board the shipping tree assigns it code 0x72 (KEY_VOLUMEDOWN)
+	 * - its "vol_up" node label notwithstanding - and puts volume up on the
+	 * PON resin line (see &pon_resin). Trust the codes, not the labels.
+	 */
+	gpio-keys {
+		compatible = "gpio-keys";
+
+		pinctrl-0 = <&volume_down_n>;
+		pinctrl-names = "default";
+
+		key-volume-down {
+			label = "Volume Down";
+			linux,code = <KEY_VOLUMEDOWN>;
+			gpios = <&pm8550_gpios 6 GPIO_ACTIVE_LOW>;
+			debounce-interval = <15>;
+			linux,can-disable;
+			wakeup-source;
+		};
+	};
+
 	reserved-memory {
 		#address-cells = <2>;
 		#size-cells = <2>;
@@ -1170,6 +1192,16 @@
  * ADC channel. Without io-channels these zones report a hardcoded 37000
  * forever - see the &pmk8550_adc comment below.
  */
+&pm8550_gpios {
+	volume_down_n: volume-down-n-state {
+		pins = "gpio6";
+		function = "normal";
+		bias-pull-up;
+		input-enable;
+		power-source = <1>;
+	};
+};
+
 &pm8550_temp_alarm {
 	io-channels = <&pmk8550_adc 0x103>;
 	io-channel-names = "thermal";
@@ -1361,7 +1393,9 @@
 };
 
 /*
- * Power and volume-down keys.
+ * Power and volume-up keys. RESIN is volume UP on this board (runtime tree:
+ * resin linux,code = 0x73), the opposite of the HDK; volume down is the
+ * gpio-keys button above.
  *
  * Two things are needed together and neither is enough alone:
  * CONFIG_POWER_RESET_QCOM_PON=y (it was =m, so pon@1300 never bound and these
@@ -1374,7 +1408,7 @@
 };
 
 &pon_resin {
-	linux,code = <KEY_VOLUMEDOWN>;
+	linux,code = <KEY_VOLUMEUP>;
 
 	status = "okay";
 };
