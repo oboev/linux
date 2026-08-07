@@ -86,6 +86,16 @@ enum qcom_battmgr_variant {
 #define USB_ADAP_TYPE			7
 #define USB_MOISTURE_DET_EN		8
 #define USB_MOISTURE_DET_STS		9
+/*
+ * oplus firmware extension: Type-C host (OTG) detection stays disarmed until
+ * OPLUS_USB_OTG_SWITCH is written with 1. VBUS is not firmware-managed
+ * either: on a sink attach the firmware raises OPLUS_NOTIF_OTG_ENABLE and
+ * waits for the AP to switch the boost regulator on.
+ */
+#define OPLUS_USB_OTG_SWITCH			18
+#define OPLUS_USB_OTG_VBUS_REGULATOR_ENABLE	24
+#define OPLUS_NOTIF_OTG_ENABLE		0x50
+#define OPLUS_NOTIF_OTG_DISABLE		0x51
 
 #define BATTMGR_WLS_PROPERTY_GET	0x34
 #define BATTMGR_WLS_PROPERTY_SET	0x35
@@ -324,6 +334,9 @@ struct qcom_battmgr {
 	struct completion ack;
 
 	bool service_up;
+	bool oplus_otg_switch;
+	bool oplus_otg_vbus_en;
+	struct work_struct oplus_otg_vbus_work;
 
 	struct qcom_battmgr_info info;
 	struct qcom_battmgr_status status;
@@ -1216,6 +1229,13 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
 	case NOTIF_WLS_PROPERTY:
 		power_supply_changed(battmgr->wls_psy);
 		break;
+	case OPLUS_NOTIF_OTG_ENABLE:
+	case OPLUS_NOTIF_OTG_DISABLE:
+		if (!battmgr->oplus_otg_switch)
+			break;
+		battmgr->oplus_otg_vbus_en = notification == OPLUS_NOTIF_OTG_ENABLE;
+		schedule_work(&battmgr->oplus_otg_vbus_work);
+		break;
 	default:
 		dev_err(battmgr->dev, "unknown notification: %#x\n", notification);
 		break;
@@ -1555,6 +1575,16 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 			break;
 		}
 		break;
+	case BATTMGR_USB_PROPERTY_SET:
+		if (payload_len != sizeof(resp->intval)) {
+			dev_warn(battmgr->dev,
+				 "invalid payload length for %#x request: %zd\n",
+				 opcode, payload_len);
+			battmgr->error = -ENODATA;
+			goto out_complete;
+		}
+		battmgr->error = le32_to_cpu(resp->intval.result);
+		break;
 	case BATTMGR_REQUEST_NOTIFICATION:
 	case BATTMGR_CHG_CTRL_LIMIT_EN:
 		battmgr->error = 0;
@@ -1596,6 +1626,31 @@ static void qcom_battmgr_enable_worker(struct work_struct *work)
 	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
 	if (ret)
 		dev_err(battmgr->dev, "failed to request power notifications\n");
+
+	if (battmgr->oplus_otg_switch) {
+		mutex_lock(&battmgr->lock);
+		ret = qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_SET,
+						    OPLUS_USB_OTG_SWITCH, 1);
+		mutex_unlock(&battmgr->lock);
+		if (ret)
+			dev_err(battmgr->dev, "failed to arm the OTG switch: %d\n", ret);
+	}
+}
+
+static void qcom_battmgr_oplus_otg_vbus_worker(struct work_struct *work)
+{
+	struct qcom_battmgr *battmgr = container_of(work, struct qcom_battmgr,
+						    oplus_otg_vbus_work);
+	bool en = battmgr->oplus_otg_vbus_en;
+	int ret;
+
+	mutex_lock(&battmgr->lock);
+	ret = qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_SET,
+					    OPLUS_USB_OTG_VBUS_REGULATOR_ENABLE, en);
+	mutex_unlock(&battmgr->lock);
+	if (ret)
+		dev_err(battmgr->dev, "failed to %s OTG vbus: %d\n",
+			en ? "enable" : "disable", ret);
 }
 
 static void qcom_battmgr_pdr_notify(void *priv, int state)
@@ -1649,6 +1704,7 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	psy_cfg_supply.num_supplicants = 1;
 
 	INIT_WORK(&battmgr->enable_work, qcom_battmgr_enable_worker);
+	INIT_WORK(&battmgr->oplus_otg_vbus_work, qcom_battmgr_oplus_otg_vbus_worker);
 	mutex_init(&battmgr->lock);
 	init_completion(&battmgr->ack);
 
@@ -1657,6 +1713,9 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 		battmgr->variant = (unsigned long)match->data;
 	else
 		battmgr->variant = QCOM_BATTMGR_SM8350;
+
+	battmgr->oplus_otg_switch = device_property_read_bool(dev->parent,
+							      "oplus,usb-otg-switch");
 
 	ret = qcom_battmgr_charge_control_thresholds_init(battmgr);
 	if (ret < 0)
