@@ -247,6 +247,13 @@
 		#size-cells = <0>;
 		orientation-gpios = <&tlmm 29 GPIO_ACTIVE_HIGH>;
 
+		/*
+		 * The oplus ADSP firmware keeps Type-C host (OTG) detection
+		 * disarmed until the USB_OTG_SWITCH property is written; with
+		 * it unset a sink on CC is never reported at all.
+		 */
+		oplus,usb-otg-switch;
+
 		connector@0 {
 			compatible = "usb-c-connector";
 			reg = <0>;
