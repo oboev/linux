@@ -324,14 +324,17 @@
 	 *
 	 * Downstream sets qcom,wsa-max-devs = <0> on this board: the WSA884x
 	 * slaves that appear on wsa_swr_master come from the SoC dtsi and are
-	 * not populated here. giulia's speakers are two Si-in sia9177 smart
-	 * amplifiers on i2c7 (0x6c/0x6d, reset gpio173/gpio178) fed from
-	 * secondary MI2S, and sia91xx has no upstream driver, so no WSA or
-	 * MI2S DAI link is claimed until one exists.
+	 * not populated here. giulia's speakers are the two sia9177 amps on
+	 * &i2c_hub_7, fed from secondary MI2S - the mi2s-dai-link below. The
+	 * I2S pins have no consumer node, so their pinctrl rides the card,
+	 * the same way db845c carries its quat MI2S pins.
 	 */
 	sound {
 		compatible = "qcom,sm8650-sndcard", "qcom,sm8450-sndcard";
 		model = "OnePlus 13R";
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&i2s1_default>;
 
 		/*
 		 * Analog mic to mic-bias mapping is downstream's
@@ -376,6 +379,28 @@
 
 			codec {
 				sound-dai = <&wcd939x 1>, <&swr2 0>, <&lpass_txmacro 0>;
+			};
+
+			platform {
+				sound-dai = <&q6apm>;
+			};
+		};
+
+		/*
+		 * The topology must carry a SECONDARY_MI2S_RX back-end for
+		 * this link to reach the DSP - the stock sm8650 blobs only
+		 * have the primary one, which is why the packaged
+		 * "OnePlus 13R" topology is a rebuild, not a symlink.
+		 */
+		mi2s-dai-link {
+			link-name = "MI2S Speakers";
+
+			cpu {
+				sound-dai = <&q6apmbedai SECONDARY_MI2S_RX>;
+			};
+
+			codec {
+				sound-dai = <&speaker_amp_l>, <&speaker_amp_r>;
 			};
 
 			platform {
@@ -1061,9 +1086,105 @@
 	};
 };
 
+/*
+ * i2c7 on the I2C hub for the two loudspeaker amplifiers. 400 kHz is
+ * downstream's qcom,clk-freq-out. Addresses, reset gpios and the reset pin
+ * config are downstream's sia91xx nodes; the amps are powered straight from
+ * the battery rail, so there is no supply to name. si,channel-num selects
+ * which of the two tuning sets baked into the driver each chip gets -
+ * downstream's channel_num, where 0 is the left/top speaker's.
+ *
+ * The wrapper must be enabled with the bus - a QUP SE never probes while
+ * its geniqup wrapper is disabled, with no error anywhere (the spi4 lesson,
+ * relearned on this bus: the symptom was "MI2S Speakers: codec dai not
+ * found" holding the whole card in deferred probe).
+ */
+&i2c_master_hub_0 {
+	status = "okay";
+};
+
+&i2c_hub_7 {
+	clock-frequency = <400000>;
+
+	status = "okay";
+
+	speaker_amp_l: audio-amplifier@6c {
+		compatible = "si,sia9177";
+		reg = <0x6c>;
+
+		/*
+		 * The secondary MI2S bit clock, via the DSP's resource
+		 * manager. Nothing else on AudioReach turns it on - the DSP
+		 * paces the stream without it and no SoC-side counter shows
+		 * its absence; the amps' PLL is what notices. Android runs
+		 * this interface at 24-bit in 32-bit slots, 3.072 MHz.
+		 */
+		clocks = <&q6prmcc LPASS_CLK_ID_SEC_MI2S_IBIT LPASS_CLK_ATTRIBUTE_COUPLE_NO>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&spkr_l_reset_n>;
+
+		reset-gpios = <&tlmm 173 GPIO_ACTIVE_HIGH>;
+
+		si,channel-num = <0>;
+		sound-name-prefix = "SpkrLeft";
+
+		#sound-dai-cells = <0>;
+	};
+
+	speaker_amp_r: audio-amplifier@6d {
+		compatible = "si,sia9177";
+		reg = <0x6d>;
+
+		clocks = <&q6prmcc LPASS_CLK_ID_SEC_MI2S_IBIT LPASS_CLK_ATTRIBUTE_COUPLE_NO>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&spkr_r_reset_n>;
+
+		reset-gpios = <&tlmm 178 GPIO_ACTIVE_HIGH>;
+
+		si,channel-num = <1>;
+		sound-name-prefix = "SpkrRight";
+
+		#sound-dai-cells = <0>;
+	};
+};
+
 /* stage 2: video decode */
 &iris {
 	status = "disabled";
+};
+
+&lpass_tlmm {
+	/*
+	 * Secondary MI2S out to the speaker amplifiers. Pins and functions
+	 * are pineapple-lpi.dtsi's i2s1 active states, drive strength is
+	 * giulia's 4 mA override. gpio9 (SD1, the IV-sense return) stays
+	 * unmuxed: nothing consumes the sense data without the vendor
+	 * protection algorithm.
+	 */
+	i2s1_default: i2s1-default-state {
+		sck-pins {
+			pins = "gpio6";
+			function = "i2s1_clk";
+			drive-strength = <4>;
+			bias-disable;
+		};
+
+		ws-pins {
+			pins = "gpio7";
+			function = "i2s1_ws";
+			drive-strength = <4>;
+			bias-disable;
+		};
+
+		sd0-pins {
+			pins = "gpio8";
+			function = "i2s1_data";
+			drive-strength = <4>;
+			bias-disable;
+		};
+	};
 };
 
 &mdss {
@@ -1564,6 +1685,27 @@
 		function = "mdp_vsync";
 		drive-strength = <2>;
 		bias-pull-down;
+	};
+
+	/*
+	 * sia9177 reset pins, drive strength from downstream's
+	 * sia91xx_gpio_L/R. High holds the amp in powerdown; output-high so
+	 * the amps stay off until playback needs them.
+	 */
+	spkr_l_reset_n: spkr-l-reset-n-state {
+		pins = "gpio173";
+		function = "gpio";
+		drive-strength = <6>;
+		bias-disable;
+		output-high;
+	};
+
+	spkr_r_reset_n: spkr-r-reset-n-state {
+		pins = "gpio178";
+		function = "gpio";
+		drive-strength = <6>;
+		bias-disable;
+		output-high;
 	};
 
 	/* Synaptics S3910 touchscreen */
