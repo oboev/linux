@@ -367,6 +367,26 @@
 	};
 
 	/*
+	 * The touchscreen's analog rail is a gpio108-gated external source,
+	 * not a PMIC LDO: downstream drives the gate high and programs no
+	 * regulator for it (synaptics,avdd-gpio; the Android snapshot shows
+	 * gpio108 out-high). 3.006 V nominal, from the older overlay node's
+	 * vdd_2v8_volt.
+	 */
+	vreg_ts_avdd: ts-avdd-regulator {
+		compatible = "regulator-fixed";
+
+		regulator-name = "vreg_ts_avdd";
+		regulator-min-microvolt = <3006000>;
+		regulator-max-microvolt = <3006000>;
+
+		gpio = <&tlmm 108 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+
+		vin-supply = <&vph_pwr>;
+	};
+
+	/*
 	 * WLAN/BT combo: WCN7850, on pcie0. Downstream calls it "cnss-kiwi" -
 	 * kiwi is Qualcomm's codename for this part.
 	 *
@@ -470,6 +490,13 @@
 
 		vdd-bob1-supply = <&vph_pwr>;
 		vdd-bob2-supply = <&vph_pwr>;
+		/*
+		 * The l1-l4-l10 parent is inferred by analogy, not measured:
+		 * sm8550 boards feed the same LDO group from their 1.86 V
+		 * bulk SMPS, and s6c is that rail here (it already feeds
+		 * l12/l15). Downstream models no parent at all.
+		 */
+		vdd-l1-l4-l10-supply = <&vreg_s6c_1p8>;
 		vdd-l2-l13-l14-supply = <&vreg_bob1>;
 		vdd-l3-supply = <&vreg_s1c_1p2>;
 		vdd-l5-l16-supply = <&vreg_bob1>;
@@ -504,6 +531,17 @@
 			regulator-allow-set-load;
 			regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
 						   RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		/*
+		 * The touchscreen's io rail. 1.8 V measured in the Android
+		 * regulator snapshot (pm_humu_l4, sole consumer spi0.0-vdd).
+		 */
+		vreg_l4b_1p8: ldo4 {
+			regulator-name = "vreg_l4b_1p8";
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
 
 		vreg_l5b_3p1: ldo5 {
@@ -894,6 +932,16 @@
 	 * the rail comes from somewhere else here - do not restore this block
 	 * from sm8650-mtp.dts.
 	 */
+};
+
+/*
+ * GPI DMA for the QUP1 wrapper, which is spi4's. Unlike gpi_dma2 below,
+ * this one is NOT belt-and-braces: spi4's SE reports FIFO disabled, so
+ * geni_spi defers with "Failed to get tx DMA ch" until the GPI controller
+ * exists, and the touchscreen never appears.
+ */
+&gpi_dma1 {
+	status = "okay";
 };
 
 /*
@@ -1331,19 +1379,31 @@
 /*
  * touchscreen. Synaptics S3910 on spi@a90000 (spi4), confirmed
  * fitted on this unit via /sys/bus/spi/devices/spi0.0/driver ->
- * synaptics_tcm_spi.
+ * synaptics_tcm_spi. Driven by the TouchComm driver written for it
+ * (synaptics-s3910.c); downstream reference is
+ * oplus/kernel/touchpanel/synaptics_hbp/ in the modules clone.
  *
- * No mainline driver exists for the Synaptics TCM HBP protocol. Downstream
- * source: modules/oplus/kernel/tp/hbp/hbp/chips/synaptics/s3910/.
+ * No touchscreen-size properties: the driver takes the coordinate range
+ * the application firmware reports, and that is the space the events are
+ * in. Downstream's 16x panel-coords space (20224x44480) is its own
+ * software rescale, not what the firmware emits - declaring it here made
+ * every touch land short of where the finger was.
+ *
+ * spi4 is the only enabled engine in the qupv3_id_0 wrapper - the SE
+ * cannot probe with its wrapper disabled, so the two go together.
  */
+&qupv3_id_0 {
+	status = "okay";
+};
+
 &spi4 {
 	pinctrl-0 = <&qup_spi4_data_clk>, <&qup_spi4_cs>;
 	pinctrl-names = "default";
 
-	status = "disabled";
+	status = "okay";
 
 	touchscreen@0 {
-		compatible = "synaptics,s3910";
+		compatible = "syna,s3910";
 		reg = <0>;
 
 		spi-max-frequency = <19000000>;
@@ -1353,12 +1413,8 @@
 
 		reset-gpios = <&tlmm 161 GPIO_ACTIVE_LOW>;
 
-		/*
-		 * Downstream supplies vdd from pm8550 L4B. No mainline sm8650
-		 * board defines ldo4 on this PMIC, and its parent rail
-		 * (vdd-l4-supply) is unverified - add the regulator to
-		 * regulators-0 before wiring this up.
-		 */
+		vdd-supply = <&vreg_l4b_1p8>;
+		avdd-supply = <&vreg_ts_avdd>;
 
 		pinctrl-0 = <&ts_int_default>, <&ts_reset_default>;
 		pinctrl-names = "default";
