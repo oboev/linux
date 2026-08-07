@@ -2048,6 +2048,15 @@ config SND_SOC_SI476X
 	tristate
 	depends on MFD_SI476X_CORE
 
+config SND_SOC_SIA9177
+	tristate "SI-IN SIA9177 speaker amplifier"
+	depends on I2C
+	select REGMAP_I2C
+	help
+	  Enable support for the SI-IN SIA9177 smart speaker amplifier.
+	  It takes audio over I2S as a clock consumer and is controlled
+	  over I2C.
+
 config SND_SOC_SIGMADSP
 	tristate
 	select CRC32
