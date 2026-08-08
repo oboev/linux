@@ -1071,6 +1071,22 @@ static int audioreach_logging_set_media_format(struct q6apm_graph *graph,
 	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
 }
 
+/*
+ * 24-bit PCM reaches the DSP LSB-aligned in 32-bit words (S24_LE — the only
+ * 24-bit format the q6apm DAIs advertise), and the SPF's processing modules
+ * only operate on 16- or 32-bit sample words: 24-bit data must be described
+ * as 32 bits per sample at Q27, never as packed 24 at Q23.
+ */
+static unsigned int audioreach_bits_per_sample(unsigned int bit_width)
+{
+	return bit_width == 24 ? 32 : bit_width;
+}
+
+static unsigned int audioreach_q_factor(unsigned int bit_width)
+{
+	return bit_width == 24 ? 27 : bit_width - 1;
+}
+
 static int audioreach_pcm_set_media_format(struct q6apm_graph *graph,
 					   const struct audioreach_module *module,
 					   const struct audioreach_module_config *mcfg)
@@ -1111,8 +1127,8 @@ static int audioreach_pcm_set_media_format(struct q6apm_graph *graph,
 	media_cfg->endianness = PCM_LITTLE_ENDIAN;
 	media_cfg->interleaved = module->interleave_type;
 	media_cfg->num_channels = mcfg->num_channels;
-	media_cfg->q_factor = mcfg->bit_width - 1;
-	media_cfg->bits_per_sample = mcfg->bit_width;
+	media_cfg->q_factor = audioreach_q_factor(mcfg->bit_width);
+	media_cfg->bits_per_sample = audioreach_bits_per_sample(mcfg->bit_width);
 	memcpy(media_cfg->channel_mapping, mcfg->channel_map, mcfg->num_channels);
 
 	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
@@ -1198,8 +1214,8 @@ static int audioreach_shmem_set_media_format(struct q6apm_graph *graph,
 		cfg->sample_rate = mcfg->sample_rate;
 		cfg->bit_width = mcfg->bit_width;
 		cfg->alignment = PCM_LSB_ALIGNED;
-		cfg->bits_per_sample = mcfg->bit_width;
-		cfg->q_factor = mcfg->bit_width - 1;
+		cfg->bits_per_sample = audioreach_bits_per_sample(mcfg->bit_width);
+		cfg->q_factor = audioreach_q_factor(mcfg->bit_width);
 		cfg->endianness = PCM_LITTLE_ENDIAN;
 		cfg->num_channels = mcfg->num_channels;
 		memcpy(cfg->channel_mapping, mcfg->channel_map, mcfg->num_channels);
