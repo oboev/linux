@@ -1159,7 +1159,9 @@
 	/*
 	 * Secondary MI2S out to the speaker amplifiers. Pins and functions
 	 * are pineapple-lpi.dtsi's i2s1 active states, drive strength is
-	 * giulia's 4 mA override. gpio9 (SD1, the IV-sense return) stays
+	 * giulia's 4 mA override. The amps' data-in is SD1 (gpio9) - the
+	 * vendor ACDB's DEVICE_HW_ENDPOINT_RX tag data for this endpoint
+	 * says SD1, and its IV-sense return endpoint SD0. gpio8 (SD0) stays
 	 * unmuxed: nothing consumes the sense data without the vendor
 	 * protection algorithm.
 	 */
@@ -1178,8 +1180,8 @@
 			bias-disable;
 		};
 
-		sd0-pins {
-			pins = "gpio8";
+		sd1-pins {
+			pins = "gpio9";
 			function = "i2s1_data";
 			drive-strength = <4>;
 			bias-disable;
