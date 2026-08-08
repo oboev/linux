@@ -88,6 +88,16 @@ static int sc8280xp_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 	case TX_CODEC_DMA_TX_3:
 		channels->min = 1;
 		break;
+	case SECONDARY_MI2S_RX:
+		/*
+		 * The sia9177 amplifiers on this back-end take the geometry
+		 * downstream programs for them: 24-bit samples in 32-bit
+		 * slots, which puts IBIT at 3.072 MHz. S16 frames latch
+		 * TDMERR in the amps.
+		 */
+		snd_mask_none(fmt);
+		snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S24_LE);
+		break;
 	default:
 		break;
 	}
