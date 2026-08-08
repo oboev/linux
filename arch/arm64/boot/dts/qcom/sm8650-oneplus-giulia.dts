@@ -834,6 +834,7 @@
 		compatible = "qcom,pm8550vs-rpmh-regulators";
 
 		vdd-l1-supply = <&vreg_s3c_0p9>;
+		vdd-l2-supply = <&vreg_s1c_1p2>;
 		vdd-l3-supply = <&vreg_s3c_0p9>;
 
 		qcom,pmic-id = "g";
@@ -842,6 +843,24 @@
 			regulator-name = "vreg_l1g_0p91";
 			regulator-min-microvolt = <912000>;
 			regulator-max-microvolt = <920000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+			regulator-allow-set-load;
+			regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
+						   RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		/*
+		 * The ultrawide camera's DVDD, and its only consumer besides
+		 * that sensor's EEPROM - the Android snapshot shows pm_v6g_l2
+		 * at 1200 mV with exactly those two. The vdd-l2 parent is
+		 * regulator-framework bookkeeping, chosen to match the way
+		 * regulators-5 feeds its own 1.2 V nldo515 (vreg_l3i_1p2);
+		 * downstream models no parent at all.
+		 */
+		vreg_l2g_1p2: ldo2 {
+			regulator-name = "vreg_l2g_1p2";
+			regulator-min-microvolt = <1200000>;
+			regulator-max-microvolt = <1200000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 			regulator-allow-set-load;
 			regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
@@ -986,6 +1005,89 @@
 	 * the rail comes from somewhere else here - do not restore this block
 	 * from sm8650-mtp.dts.
 	 */
+};
+
+/*
+ * Only the ultrawide is wired up so far: an IMX355 on CSIPHY0, reached over
+ * CCI0 master 0. The board's other three sensors sit on CSIPHY1 (main),
+ * CSIPHY3 (tele) and CSIPHY4 (front) and have no upstream driver.
+ *
+ * The CSIPHY rails are measured, not inherited from the reference design:
+ * the Android snapshot's regulator-summary puts every csiphy's csi-vdd-0p9
+ * on pm8550ve L2 and every csi-vdd-1p2 on its L3.
+ */
+&camss {
+	vdd-csiphy01-0p9-supply = <&vreg_l2i_0p88>;
+	vdd-csiphy01-1p2-supply = <&vreg_l3i_1p2>;
+
+	status = "okay";
+
+	ports {
+		port@0 {
+			csiphy0_ep: endpoint {
+				data-lanes = <0 1 2 3>;
+				remote-endpoint = <&imx355_ep>;
+			};
+		};
+	};
+};
+
+&cci0 {
+	status = "okay";
+};
+
+/*
+ * 400 kHz, not the 1 MHz sm8650.dtsi defaults to: this sensor's vendor
+ * module blob asks for i2c fast mode, where the other three ask for fast
+ * plus. CCI0 master 1 - the main camera's - keeps the default.
+ */
+&cci0_i2c0 {
+	clock-frequency = <400000>;
+
+	camera@1a {
+		compatible = "sony,imx355";
+		reg = <0x1a>;
+
+		clocks = <&camcc CAM_CC_MCLK2_CLK>;
+		assigned-clocks = <&camcc CAM_CC_MCLK2_CLK>;
+		assigned-clock-rates = <19200000>;
+
+		reset-gpios = <&tlmm 14 GPIO_ACTIVE_LOW>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam2_default>;
+
+		avdd-supply = <&vreg_l4m_2p8>;
+		dvdd-supply = <&vreg_l2g_1p2>;
+		dovdd-supply = <&vreg_l5m_1p8>;
+
+		orientation = <1>;
+		/*
+		 * 270, not the 90 the downstream tree's sensor-position-roll
+		 * suggests: measured on the preview, where 90 puts the scene
+		 * upside down. The property is the counter-clockwise angle
+		 * between the sensor's readout frame and the projected scene,
+		 * and only a picture on the panel can settle which way round
+		 * that lands - a capture pulled to a host says nothing unless
+		 * the phone's pose at the time is known.
+		 */
+		rotation = <270>;
+
+		port {
+			imx355_ep: endpoint {
+				/*
+				 * The lane count is needed on BOTH ends here.
+				 * imx355 parses its own endpoint and refuses
+				 * anything but four lanes; sm8650-qrd's s5kjn1
+				 * gets away with declaring them only on the
+				 * camss side because that driver never looks.
+				 */
+				data-lanes = <0 1 2 3>;
+				link-frequencies = /bits/ 64 <360000000>;
+				remote-endpoint = <&csiphy0_ep>;
+			};
+		};
+	};
 };
 
 /*
