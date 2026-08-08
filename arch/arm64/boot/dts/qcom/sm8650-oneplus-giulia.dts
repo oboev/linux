@@ -1155,40 +1155,6 @@
 	status = "disabled";
 };
 
-&lpass_tlmm {
-	/*
-	 * Secondary MI2S out to the speaker amplifiers. Pins and functions
-	 * are pineapple-lpi.dtsi's i2s1 active states, drive strength is
-	 * giulia's 4 mA override. The amps' data-in is SD1 (gpio9) - the
-	 * vendor ACDB's DEVICE_HW_ENDPOINT_RX tag data for this endpoint
-	 * says SD1, and its IV-sense return endpoint SD0. gpio8 (SD0) stays
-	 * unmuxed: nothing consumes the sense data without the vendor
-	 * protection algorithm.
-	 */
-	i2s1_default: i2s1-default-state {
-		sck-pins {
-			pins = "gpio6";
-			function = "i2s1_clk";
-			drive-strength = <4>;
-			bias-disable;
-		};
-
-		ws-pins {
-			pins = "gpio7";
-			function = "i2s1_ws";
-			drive-strength = <4>;
-			bias-disable;
-		};
-
-		sd1-pins {
-			pins = "gpio9";
-			function = "i2s1_data";
-			drive-strength = <4>;
-			bias-disable;
-		};
-	};
-};
-
 &mdss {
 	status = "okay";
 };
@@ -1680,6 +1646,41 @@
 		function = "gpio";
 		drive-strength = <2>;
 		bias-pull-down;
+	};
+
+	/*
+	 * Secondary MI2S out to the speaker amplifiers - on the SoC TLMM,
+	 * not the LPI pads. Downstream's cdc_sec_mi2s_gpios and giulia's
+	 * 4 mA overrides both target pineapple-pinctrl.dtsi's unprefixed
+	 * i2s1_*_active states (gpio121-124), and the captured runtime tree
+	 * confirms them live; pineapple-lpi.dtsi's same-named lpi_i2s1
+	 * states on LPI gpio6-9 are unused on this board. The amps' data-in
+	 * is SD1 (gpio124) - the vendor ACDB's DEVICE_HW_ENDPOINT_RX tag
+	 * data for this endpoint says SD1, and its IV-sense return endpoint
+	 * SD0. gpio122 (SD0) stays unmuxed: nothing consumes the sense data
+	 * without the vendor protection algorithm.
+	 */
+	i2s1_default: i2s1-default-state {
+		sck-pins {
+			pins = "gpio121";
+			function = "i2s1_sck";
+			drive-strength = <4>;
+			bias-disable;
+		};
+
+		ws-pins {
+			pins = "gpio123";
+			function = "i2s1_ws";
+			drive-strength = <4>;
+			bias-disable;
+		};
+
+		sd1-pins {
+			pins = "gpio124";
+			function = "i2s1_data1";
+			drive-strength = <4>;
+			bias-pull-down;
+		};
 	};
 
 	mdp_vsync: mdp-vsync-state {
