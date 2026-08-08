@@ -39,6 +39,24 @@
 #define SIA9177_STATE_RUNNING	0x0005
 
 /*
+ * Fault bits in INT_STAT, from the vendor driver's irq_range[]. Sticky:
+ * cleared by writing ones to INT_CLEAR, or by reset.
+ */
+#define SIA9177_INT_POR		BIT(0)
+#define SIA9177_INT_NOCLK	BIT(2)
+#define SIA9177_INT_OTP		BIT(3)
+#define SIA9177_INT_UVP		BIT(5)
+#define SIA9177_INT_OCP		BIT(6)
+#define SIA9177_INT_TDMERR	BIT(7)
+
+/*
+ * The chip ramps 2 -> 4 -> 5 over some milliseconds once the startup
+ * sequence has landed, so RUN has to be watched for rather than read once.
+ */
+#define SIA9177_RUN_POLL_US	1000
+#define SIA9177_RUN_TIMEOUT_US	20000
+
+/*
  * Reset pin polarity: driving it high holds the chip in reset/powerdown,
  * low lets it run (the vendor driver's SIA91XX_ENABLE_LEVEL is 0).
  */
@@ -55,6 +73,7 @@ struct sia9177_priv {
 	struct gpio_desc *reset_gpio;
 	struct clk *bclk;
 	unsigned long bclk_rate;
+	bool bclk_on;
 	const struct sia9177_tuning *tuning;
 };
 
@@ -105,6 +124,28 @@ static const struct sia9177_tuning sia9177_tuning_right = {
 	.start_len = ARRAY_SIZE(sia9177_start_right),
 };
 
+static void sia9177_report_faults(struct snd_soc_component *component,
+				  const char *when, unsigned int stat)
+{
+	dev_warn(component->dev, "faults latched %s: %#x%s%s%s%s%s%s\n",
+		 when, stat,
+		 stat & SIA9177_INT_POR ? " POR" : "",
+		 stat & SIA9177_INT_NOCLK ? " NOCLK" : "",
+		 stat & SIA9177_INT_OTP ? " OTP" : "",
+		 stat & SIA9177_INT_UVP ? " UVP" : "",
+		 stat & SIA9177_INT_OCP ? " OCP" : "",
+		 stat & SIA9177_INT_TDMERR ? " TDMERR" : "");
+}
+
+static void sia9177_bclk_disable(struct sia9177_priv *priv)
+{
+	if (!priv->bclk_on)
+		return;
+
+	clk_disable_unprepare(priv->bclk);
+	priv->bclk_on = false;
+}
+
 /*
  * The chip latches its clock configuration when BCLK first appears, so
  * bring-up is split the way the vendor driver splits it: reset release and
@@ -126,20 +167,27 @@ static int sia9177_configure(struct snd_soc_component *component)
 	ret = regmap_multi_reg_write(priv->regmap, priv->tuning->init,
 				     priv->tuning->init_len);
 	if (ret)
-		return ret;
+		goto err_reset;
 
 	ret = regmap_read(priv->regmap, SIA9177_REG_STATE, &val);
 	if (ret)
-		return ret;
+		goto err_reset;
 	if ((val & SIA9177_STATE_MASK) != SIA9177_STATE_STANDBY)
 		dev_warn(component->dev, "not in standby after init: %#x\n",
 			 val);
 
 	/* clear whatever interrupt state reset left behind */
-	regmap_read(priv->regmap, SIA9177_REG_INT_STAT, &val);
 	regmap_write(priv->regmap, SIA9177_REG_INT_CLEAR, 0xffff);
 
 	return 0;
+
+	/*
+	 * The core skips .shutdown for a DAI whose .startup failed, so this
+	 * is the only thing that can put the chip back in powerdown.
+	 */
+err_reset:
+	gpiod_set_value_cansleep(priv->reset_gpio, 1);
+	return ret;
 }
 
 static int sia9177_power_up(struct snd_soc_component *component)
@@ -155,24 +203,56 @@ static int sia9177_power_up(struct snd_soc_component *component)
 	 * only thing that notices.
 	 */
 	if (priv->bclk) {
-		clk_set_rate(priv->bclk, priv->bclk_rate);
-		ret = clk_prepare_enable(priv->bclk);
-		if (ret)
+		ret = clk_set_rate(priv->bclk, priv->bclk_rate);
+		if (ret) {
+			dev_err(component->dev,
+				"cannot set bit clock to %lu Hz: %d\n",
+				priv->bclk_rate, ret);
 			return ret;
+		}
+
+		ret = clk_prepare_enable(priv->bclk);
+		if (ret) {
+			dev_err(component->dev,
+				"cannot enable bit clock: %d\n", ret);
+			return ret;
+		}
+		priv->bclk_on = true;
 	}
 
 	ret = regmap_multi_reg_write(priv->regmap, priv->tuning->start,
 				     priv->tuning->start_len);
 	if (ret)
-		return ret;
+		goto err_bclk;
 
-	ret = regmap_read(priv->regmap, SIA9177_REG_STATE, &val);
-	if (ret)
-		return ret;
-	if ((val & SIA9177_STATE_MASK) != SIA9177_STATE_RUNNING)
-		dev_warn(component->dev, "failed to start: state %#x\n", val);
+	/*
+	 * Watch the state nibble rather than reading it once: the chip climbs
+	 * 2 -> 4 -> 5 over some milliseconds from here, and a single read
+	 * catches it mid-ramp and calls a success a failure. If it really does
+	 * not arrive, INT_STAT says why - TDMERR for a geometry the chip
+	 * rejects, NOCLK for a bit clock that never came - and a nibble still
+	 * at 2 means the startup writes did not take at all.
+	 */
+	ret = regmap_read_poll_timeout(priv->regmap, SIA9177_REG_STATE, val,
+				       (val & SIA9177_STATE_MASK) ==
+					       SIA9177_STATE_RUNNING,
+				       SIA9177_RUN_POLL_US,
+				       SIA9177_RUN_TIMEOUT_US);
+	if (ret) {
+		unsigned int stat;
+
+		dev_warn(component->dev, "failed to start: state %#x (%d)\n",
+			 val, ret);
+		if (!regmap_read(priv->regmap, SIA9177_REG_INT_STAT, &stat) &&
+		    stat)
+			sia9177_report_faults(component, "at start", stat);
+	}
 
 	return 0;
+
+err_bclk:
+	sia9177_bclk_disable(priv);
+	return ret;
 }
 
 static void sia9177_power_down(struct snd_soc_component *component)
@@ -189,8 +269,19 @@ static void sia9177_power_down(struct snd_soc_component *component)
 	    (val & SIA9177_STATE_MASK) != SIA9177_STATE_STANDBY)
 		dev_warn(component->dev, "failed to stop: state %#x\n", val);
 
-	if (priv->bclk)
-		clk_disable_unprepare(priv->bclk);
+	/*
+	 * Last chance to see what the stream latched: .shutdown asserts reset
+	 * straight after this, which clears the register. Nothing mainline
+	 * consumes the IV sense the vendor's excursion protection runs on, so
+	 * the sticky over-temperature/over-current/under-voltage bits are the
+	 * only telemetry there is that playback was overdriving the parts.
+	 */
+	if (!regmap_read(priv->regmap, SIA9177_REG_INT_STAT, &val) && val) {
+		sia9177_report_faults(component, "during playback", val);
+		regmap_write(priv->regmap, SIA9177_REG_INT_CLEAR, 0xffff);
+	}
+
+	sia9177_bclk_disable(priv);
 }
 
 static int sia9177_hw_params(struct snd_pcm_substream *substream,
