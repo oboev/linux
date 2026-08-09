@@ -1252,6 +1252,19 @@
 	};
 };
 
+/*
+ * The modem's data path. Enabled alongside the modem itself rather than after
+ * it, because CONFIG_QCOM_IPA is a module and can be removed at runtime if it
+ * misbehaves, where splitting the two would cost a second boot_b reflash.
+ */
+&ipa {
+	qcom,gsi-loader = "self";
+	memory-region = <&ipa_fw_mem>;
+	firmware-name = "qcom/sm8650/oneplus/giulia/ipa_fws.mbn";
+
+	status = "okay";
+};
+
 /* stage 2: video decode */
 &iris {
 	status = "disabled";
@@ -1677,11 +1690,17 @@
 	status = "okay";
 };
 
+/*
+ * ⛔ auto_boot is false for mpss, unlike adsp and cdsp: enabling this node
+ * starts nothing by itself. rmtfs runs with -s and brings the remoteproc up
+ * with it, so an "offline" state with an otherwise silent log is a userspace
+ * problem, not a firmware one (modem.md).
+ */
 &remoteproc_mpss {
 	firmware-name = "qcom/sm8650/oneplus/giulia/modem.mbn",
 			"qcom/sm8650/oneplus/giulia/modem_dtb.mbn";
 
-	status = "disabled";
+	status = "okay";
 };
 
 &sleep_clk {
