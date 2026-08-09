@@ -1848,6 +1848,44 @@
 	};
 };
 
+/*
+ * Bluetooth - the WCN7850's UART side. SE14, which downstream drives as
+ * qupv3_se14_4uart (qcom/bt/pineapple-kiwi-bt.dtsi in the devicetrees
+ * clone); its wrapper qupv3_id_1 and the 4-wire pin mux are already up for
+ * the uart15 console. Power sequencing and BT_EN (gpio17) come from the
+ * wcn7850-pmu node, shared with WLAN - downstream's SW_CTRL (gpio18) has no
+ * mainline consumer, and enable-gpios/swctrl-gpios are deprecated in favour
+ * of the pmu.
+ *
+ * local-bd-address is required here, not cosmetic: the vendor NV
+ * (qca/hmtnv20.bin) programs QCA's default 00:00:00:00:5a:ad, btqca sees
+ * the controller report exactly that and asks the core for this property,
+ * and without one the device comes up unconfigured - hci0 exists and
+ * refuses to power on. The factory address sits in SFS-encrypted modem NV
+ * like the WLAN one, so this is a locally administered address derived from
+ * the WLAN MAC the firmware reports (02:00:90:11:53:5f), + 1. Least
+ * significant byte first, per the binding.
+ */
+&uart14 {
+	status = "okay";
+
+	bluetooth {
+		compatible = "qcom,wcn7850-bt";
+
+		vddaon-supply = <&vreg_pmu_aon_0p59>;
+		vddrfa0p8-supply = <&vreg_pmu_rfa_0p8>;
+		vddrfa1p2-supply = <&vreg_pmu_rfa_1p2>;
+		vddrfa1p8-supply = <&vreg_pmu_rfa_1p8>;
+		vddrfacmn-supply = <&vreg_pmu_rfa_cmn>;
+		vddwlcx-supply = <&vreg_pmu_wlcx_0p8>;
+		vddwlmx-supply = <&vreg_pmu_wlmx_0p85>;
+
+		local-bd-address = [ 60 53 11 90 00 02 ];
+
+		max-speed = <3200000>;
+	};
+};
+
 &uart15 {
 	status = "okay";
 };
