@@ -135,7 +135,7 @@ static const struct ipa_gsi_endpoint_data ipa_gsi_endpoint_data[] = {
 	[IPA_ENDPOINT_AP_MODEM_RX] = {
 		.ee_id		= GSI_EE_AP,
 		.channel_id	= 1,
-		.endpoint_id	= 23,
+		.endpoint_id	= 24,
 		.toward_ipa	= false,
 		.channel = {
 			.tre_count	= 256,
@@ -168,7 +168,7 @@ static const struct ipa_gsi_endpoint_data ipa_gsi_endpoint_data[] = {
 	[IPA_ENDPOINT_MODEM_AP_RX] = {
 		.ee_id		= GSI_EE_MODEM,
 		.channel_id	= 7,
-		.endpoint_id	= 21,
+		.endpoint_id	= 22,
 		.toward_ipa	= false,
 	},
 	[IPA_ENDPOINT_MODEM_DL_NLO_TX] = {
