@@ -31,7 +31,10 @@ struct q6apm_graph;
 #define MODULE_ID_FLAC_DEC		0x0700102F
 #define MODULE_ID_SMECNS_V2		0x07001031
 #define MODULE_ID_MP3_DECODE		0x0700103B
+#define MODULE_ID_SMART_SYNC		0x0700103C
 #define MODULE_ID_GAPLESS		0x0700104D
+#define MODULE_ID_MAILBOX_TX		0x07001056
+#define MODULE_ID_MAILBOX_RX		0x07001057
 #define MODULE_ID_DISPLAY_PORT_SINK	0x07001069
 #define MODULE_ID_SPEAKER_PROTECTION	0x070010E2
 #define MODULE_ID_SPEAKER_PROTECTION_VI	0x070010E3
@@ -44,6 +47,29 @@ struct q6apm_graph;
 #define PRM_MODULE_INSTANCE_ID		0x00000002
 #define AMDB_MODULE_INSTANCE_ID		0x00000003
 #define VCPM_MODULE_INSTANCE_ID		0x00000004
+
+/*
+ * The Voice Call Processing Manager - the static ADSP service that runs a
+ * voice-call session once the client names the graph's voice roles (tag ->
+ * module instance) and a Voice System ID. Programmed with APM_CMD_SET_CFG
+ * against instance 0x4; the modem talks to it directly after that.
+ */
+#define VCPM_PARAM_ID_VOICE_CONFIG		0x08001162
+#define VCPM_PROPERTY_ID_TAG_INFO		0x080011B2
+#define VCPM_PARAM_ID_VSID			0x080011BC
+#define VCPM_PARAM_ID_TX_DEV_PP_CHANNEL_INFO	0x08001310
+#define VCPM_PARAM_ID_VOC_PKT_LOOPBACK_DELAY	0x08001311
+
+#define VOICE_MOD_TAG_ID_ENCODER		0x08001177
+#define VOICE_MOD_TAG_ID_TX_MAILBOX		0x08001178
+#define VOICE_MOD_TAG_ID_DECODER		0x0800117B
+#define VOICE_MOD_TAG_ID_RX_MAILBOX		0x0800117C
+#define VOICE_MOD_TAG_ID_TX_SMART_SYNC		0x080011AD
+
+#define VOICE_VSID_SUB1				0x11C05000
+#define VOICE_VSID_SUB2				0x11DC5000
+#define VOICE_VSID_LB_SUB1			0x12006000
+#define VOICE_VSID_LB_SUB2			0x121C6000
 #define AR_MODULE_INSTANCE_ID_START	0x00006000
 #define AR_MODULE_INSTANCE_ID_END	0x00007000
 #define AR_MODULE_DYNAMIC_INSTANCE_ID_START	0x00007000
@@ -425,6 +451,36 @@ struct apm_module_param_data  {
 } __packed;
 
 #define APM_MODULE_PARAM_DATA_SIZE	sizeof(struct apm_module_param_data)
+
+/* VCPM payloads (vcpm_api.h layouts) */
+struct vcpm_param_vsid {
+	uint32_t vsid;
+} __packed;
+
+struct vcpm_cfg_sg_props {
+	uint32_t sub_graph_id;
+	uint32_t num_props;
+} __packed;
+
+struct vcpm_prop_cfg {
+	uint32_t prop_id;
+	uint32_t prop_size;
+} __packed;
+
+struct vcpm_tag_miid {
+	uint32_t tag_id;
+	uint32_t module_iid;
+} __packed;
+
+struct vcpm_tx_ch_info {
+	uint32_t vsid;
+	uint32_t num_channels;
+} __packed;
+
+struct vcpm_lb_delay {
+	uint32_t vsid;
+	uint32_t delay_ms;	/* rounded up to 20 ms steps by the DSP */
+} __packed;
 
 struct apm_module_param_shared_data  {
 	uint32_t param_id;
@@ -912,6 +968,9 @@ struct audioreach_module_config {
 };
 
 /* Packet Allocation routines */
+int audioreach_send_voice_config(struct q6apm_graph *graph, int dir,
+				 uint32_t vsid, uint32_t tx_channels,
+				 uint32_t lb_delay_ms);
 void *audioreach_alloc_apm_cmd_pkt(int pkt_size, uint32_t opcode, uint32_t
 				    token);
 void audioreach_set_default_channel_mapping(u8 *ch_map, int num_channels);

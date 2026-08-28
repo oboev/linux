@@ -81,6 +81,9 @@ struct q6apm_dai_rtd {
 	struct q6apm_graph *graph;
 	spinlock_t lock;
 	bool notify_on_drain;
+	/* hostless voice graph */
+	bool voice;
+	uint32_t vsid;
 };
 
 struct q6apm_dai_data {
@@ -125,6 +128,34 @@ static const struct snd_pcm_hardware q6apm_dai_hardware_playback = {
 	.periods_min =          PLAYBACK_MIN_NUM_PERIODS,
 	.periods_max =          PLAYBACK_MAX_NUM_PERIODS,
 	.fifo_size =            0,
+};
+
+/* 2 x 10 ms at 48 kHz/S16/stereo - a token geometry, no data ever moves */
+#define VOICE_PERIOD_BYTES	1920
+/* the handset's vocoder-packet loopback delay (odm resourcemanager.xml) */
+#define Q6APM_VOICE_LB_DELAY_MS	1000
+
+/*
+ * Hostless voice graphs: the mailbox modules exchange vocoder packets with
+ * the modem inside the DSP, the PCM is only the control surface. No MMAP,
+ * no data path, a token buffer.
+ */
+static const struct snd_pcm_hardware q6apm_dai_hardware_voice = {
+	.info =			(SNDRV_PCM_INFO_INTERLEAVED |
+				 SNDRV_PCM_INFO_BLOCK_TRANSFER |
+				 SNDRV_PCM_INFO_BATCH),
+	.formats =		SNDRV_PCM_FMTBIT_S16_LE,
+	.rates =		SNDRV_PCM_RATE_48000,
+	.rate_min =		48000,
+	.rate_max =		48000,
+	.channels_min =		1,
+	.channels_max =		2,
+	.buffer_bytes_max =	2 * VOICE_PERIOD_BYTES,
+	.period_bytes_min =	VOICE_PERIOD_BYTES,
+	.period_bytes_max =	VOICE_PERIOD_BYTES,
+	.periods_min =		2,
+	.periods_max =		2,
+	.fifo_size =		0,
 };
 
 static void event_handler(uint32_t opcode, uint32_t token, void *payload, void *priv)
@@ -236,6 +267,47 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
 	cfg.bit_width = prtd->bits_per_sample;
 	cfg.fmt = SND_AUDIOCODEC_PCM;
 	audioreach_set_default_channel_mapping(cfg.channel_map, runtime->channels);
+
+	if (prtd->voice) {
+		if (prtd->state) {
+			/* re-prepare: stop, nothing else to tear down */
+			q6apm_graph_stop(prtd->graph);
+			prtd->state = Q6APM_STREAM_IDLE;
+		}
+
+		ret = audioreach_send_voice_config(prtd->graph, substream->stream,
+						   prtd->vsid,
+						   substream->stream == SNDRV_PCM_STREAM_CAPTURE ?
+							runtime->channels : 0,
+						   Q6APM_VOICE_LB_DELAY_MS);
+		if (ret) {
+			dev_err(dev, "Voice config failed %d\n", ret);
+			return ret;
+		}
+
+		ret = q6apm_graph_media_format_pcm(prtd->graph, &cfg);
+		if (ret) {
+			dev_err(dev, "Failed to set media format %d\n", ret);
+			return ret;
+		}
+
+		ret = q6apm_graph_prepare(prtd->graph);
+		if (ret) {
+			dev_err(dev, "Failed to prepare Graph %d\n", ret);
+			return ret;
+		}
+
+		ret = q6apm_graph_start(prtd->graph);
+		if (ret) {
+			dev_err(dev, "Failed to Start Graph %d\n", ret);
+			return ret;
+		}
+
+		prtd->state = Q6APM_STREAM_RUNNING;
+
+		return 0;
+	}
+
 	if (prtd->state) {
 		/* clear the previous setup if any  */
 		q6apm_graph_stop(prtd->graph);
@@ -317,7 +389,7 @@ static int q6apm_dai_ack(struct snd_soc_component *component, struct snd_pcm_sub
 	struct q6apm_dai_rtd *prtd = runtime->private_data;
 	int i, ret = 0, avail_periods;
 
-	if (q6apm_is_graph_in_push_pull_mode(prtd->graph))
+	if (prtd->voice || q6apm_is_graph_in_push_pull_mode(prtd->graph))
 		return 0;
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
@@ -396,6 +468,20 @@ static int q6apm_dai_open(struct snd_soc_component *component,
 		goto err;
 	}
 
+	prtd->voice = q6apm_is_voice_graph(prtd->graph, substream->stream);
+	if (prtd->voice) {
+		/*
+		 * Hostless: latch the session VSID, take the token geometry,
+		 * and skip every shared-memory constraint below.
+		 */
+		ret = q6apm_voice_acquire(dev, &prtd->vsid);
+		if (ret)
+			goto err_close;
+		runtime->hw = q6apm_dai_hardware_voice;
+		runtime->private_data = prtd;
+		return 0;
+	}
+
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
 		runtime->hw = q6apm_dai_hardware_playback;
 	else if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
@@ -405,7 +491,7 @@ static int q6apm_dai_open(struct snd_soc_component *component,
 	ret = snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
 	if (ret < 0) {
 		dev_err(dev, "snd_pcm_hw_constraint_integer failed\n");
-		goto err;
+		goto err_close;
 	}
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
@@ -413,7 +499,7 @@ static int q6apm_dai_open(struct snd_soc_component *component,
 						   BUFFER_BYTES_MIN, BUFFER_BYTES_MAX);
 		if (ret < 0) {
 			dev_err(dev, "constraint for buffer bytes min max ret = %d\n", ret);
-			goto err;
+			goto err_close;
 		}
 	}
 
@@ -421,13 +507,13 @@ static int q6apm_dai_open(struct snd_soc_component *component,
 	ret = snd_pcm_hw_constraint_step(runtime, 0, SNDRV_PCM_HW_PARAM_PERIOD_SIZE, 480);
 	if (ret < 0) {
 		dev_err(dev, "constraint for period bytes step ret = %d\n", ret);
-		goto err;
+		goto err_close;
 	}
 
 	ret = snd_pcm_hw_constraint_step(runtime, 0, SNDRV_PCM_HW_PARAM_BUFFER_SIZE, 480);
 	if (ret < 0) {
 		dev_err(dev, "constraint for buffer bytes step ret = %d\n", ret);
-		goto err;
+		goto err_close;
 	}
 
 	runtime->private_data = prtd;
@@ -446,6 +532,8 @@ static int q6apm_dai_open(struct snd_soc_component *component,
 	}
 
 	return 0;
+err_close:
+	q6apm_graph_close(prtd->graph);
 err:
 	kfree(prtd);
 
@@ -461,8 +549,12 @@ static int q6apm_dai_close(struct snd_soc_component *component,
 	if (prtd->state) {
 		/* only stop graph that is started */
 		q6apm_graph_stop(prtd->graph);
-		q6apm_free_fragments(prtd->graph, substream->stream);
+		if (!prtd->voice)
+			q6apm_free_fragments(prtd->graph, substream->stream);
 	}
+
+	if (prtd->voice)
+		q6apm_voice_release(component->dev);
 
 	q6apm_graph_close(prtd->graph);
 	prtd->graph = NULL;
@@ -478,6 +570,9 @@ static snd_pcm_uframes_t q6apm_dai_pointer(struct snd_soc_component *component,
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct q6apm_dai_rtd *prtd = runtime->private_data;
 	snd_pcm_uframes_t ptr;
+
+	if (prtd->voice)
+		return 0;
 
 	if (q6apm_is_graph_in_push_pull_mode(prtd->graph)) {
 		int retries = 10;
@@ -593,6 +688,12 @@ static int q6apm_dai_pcm_new(struct snd_soc_component *component, struct snd_soc
 
 
 	if (substream) {
+		if (q6apm_is_voice_graph_from_id(component->dev, graph_id,
+						 substream->stream))
+			/* hostless: a token buffer, nothing mapped to the DSP */
+			return snd_pcm_set_fixed_buffer_all(pcm, SNDRV_DMA_TYPE_DEV,
+							    component->dev, PAGE_SIZE);
+
 		is_push_pull = q6apm_is_graph_in_push_pull_mode_from_id(component->dev,
 									graph_id,
 									substream->stream);
@@ -627,6 +728,10 @@ static void q6apm_dai_memory_unmap(struct snd_soc_component *component,
 		return;
 
 	graph_id = cpu_dai->driver->id;
+
+	if (q6apm_is_voice_graph_from_id(component->dev, graph_id, substream->stream))
+		return;
+
 	q6apm_unmap_memory_fixed_region(component->dev, graph_id);
 
 	if (q6apm_is_graph_in_push_pull_mode_from_id(component->dev, graph_id, substream->stream))

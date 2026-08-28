@@ -1436,6 +1436,190 @@ int audioreach_set_media_format(struct q6apm_graph *graph,
 }
 EXPORT_SYMBOL_GPL(audioreach_set_media_format);
 
+/* The voice roles VCPM can be told about, index-aligned with the counters */
+static const uint32_t audioreach_voice_tags[] = {
+	VOICE_MOD_TAG_ID_ENCODER,
+	VOICE_MOD_TAG_ID_TX_MAILBOX,
+	VOICE_MOD_TAG_ID_DECODER,
+	VOICE_MOD_TAG_ID_RX_MAILBOX,
+	VOICE_MOD_TAG_ID_TX_SMART_SYNC,
+};
+
+enum { AR_VROLE_ENC, AR_VROLE_TX_MB, AR_VROLE_DEC, AR_VROLE_RX_MB, AR_VROLE_SYNC };
+
+static int audioreach_voice_role(uint32_t module_id)
+{
+	switch (module_id) {
+	case MODULE_ID_PLACEHOLDER_ENCODER:
+		return AR_VROLE_ENC;
+	case MODULE_ID_MAILBOX_TX:
+		return AR_VROLE_TX_MB;
+	case MODULE_ID_PLACEHOLDER_DECODER:
+		return AR_VROLE_DEC;
+	case MODULE_ID_MAILBOX_RX:
+		return AR_VROLE_RX_MB;
+	case MODULE_ID_SMART_SYNC:
+		return AR_VROLE_SYNC;
+	default:
+		return -1;
+	}
+}
+
+#define AR_VOICE_MAX_SG		4
+#define AR_VOICE_MAX_TAGS	ARRAY_SIZE(audioreach_voice_tags)
+
+/*
+ * Hand VCPM (static instance 0x4) everything it needs to run a voice-call
+ * session on this graph: which module instance plays which role (derived
+ * from the module IDs, validated - the vendor's own tables in the ACDB
+ * carry exactly these pairs), the Voice System ID, the TX device channel
+ * count, and the vocoder-packet loopback delay for loopback VSIDs.
+ */
+int audioreach_send_voice_config(struct q6apm_graph *graph, int dir,
+				 uint32_t vsid, uint32_t tx_channels,
+				 uint32_t lb_delay_ms)
+{
+	struct audioreach_graph_info *info = graph->info;
+	struct vcpm_tag_miid tags[AR_VOICE_MAX_SG][AR_VOICE_MAX_TAGS];
+	struct audioreach_container *container;
+	struct apm_module_param_data *param_data;
+	struct audioreach_sub_graph *sgs;
+	struct audioreach_module *module;
+	struct vcpm_cfg_sg_props *sg_props;
+	struct vcpm_prop_cfg *prop_cfg;
+	struct vcpm_tx_ch_info *ch_info;
+	struct vcpm_param_vsid *vsid_pl;
+	struct vcpm_lb_delay *lb_delay;
+	uint32_t sg_id[AR_VOICE_MAX_SG];
+	int ntags[AR_VOICE_MAX_SG] = {};
+	int rolecnt[AR_VOICE_MAX_TAGS] = {};
+	int payload_size, vc_size;
+	int nsg = 0, i, j, role;
+	bool send_lb_delay;
+	void *p;
+
+	/* collect the voice roles, subgraph by subgraph */
+	list_for_each_entry(sgs, &info->sg_list, node) {
+		int idx = -1;
+
+		list_for_each_entry(container, &sgs->container_list, node) {
+			list_for_each_entry(module, &container->modules_list, node) {
+				role = audioreach_voice_role(module->module_id);
+				if (role < 0)
+					continue;
+				/* a duplicate role makes the table nonsense */
+				if (rolecnt[role]++)
+					return -EINVAL;
+				if (idx < 0) {
+					if (nsg == AR_VOICE_MAX_SG)
+						return -EINVAL;
+					idx = nsg++;
+					sg_id[idx] = sgs->sub_graph_id;
+				}
+				tags[idx][ntags[idx]].tag_id = audioreach_voice_tags[role];
+				tags[idx][ntags[idx]].module_iid = module->instance_id;
+				ntags[idx]++;
+			}
+		}
+	}
+
+	/* the direction's mailbox and codec role must both be present */
+	if (dir == SNDRV_PCM_STREAM_PLAYBACK) {
+		if (!rolecnt[AR_VROLE_RX_MB] || !rolecnt[AR_VROLE_DEC])
+			return -EINVAL;
+	} else {
+		if (!rolecnt[AR_VROLE_TX_MB] || !rolecnt[AR_VROLE_ENC])
+			return -EINVAL;
+	}
+
+	send_lb_delay = lb_delay_ms &&
+			(vsid == VOICE_VSID_LB_SUB1 || vsid == VOICE_VSID_LB_SUB2);
+
+	vc_size = sizeof(uint32_t);
+	for (i = 0; i < nsg; i++)
+		vc_size += sizeof(*sg_props) + sizeof(*prop_cfg) +
+			   sizeof(uint32_t) + ntags[i] * sizeof(struct vcpm_tag_miid);
+
+	payload_size = ALIGN(APM_MODULE_PARAM_DATA_SIZE + vc_size, 8) +
+		       ALIGN(APM_MODULE_PARAM_DATA_SIZE + sizeof(*vsid_pl), 8);
+	if (dir == SNDRV_PCM_STREAM_CAPTURE && tx_channels)
+		payload_size += ALIGN(APM_MODULE_PARAM_DATA_SIZE + sizeof(*ch_info), 8);
+	if (send_lb_delay)
+		payload_size += ALIGN(APM_MODULE_PARAM_DATA_SIZE + sizeof(*lb_delay), 8);
+
+	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(payload_size,
+									 APM_CMD_SET_CFG, 0);
+	if (IS_ERR(pkt))
+		return PTR_ERR(pkt);
+
+	p = (void *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
+
+	param_data = p;
+	param_data->module_instance_id = VCPM_MODULE_INSTANCE_ID;
+	param_data->param_id = VCPM_PARAM_ID_VOICE_CONFIG;
+	param_data->param_size = vc_size;
+	param_data->error_code = 0;
+	p += APM_MODULE_PARAM_DATA_SIZE;
+	*(uint32_t *)p = nsg;
+	p += sizeof(uint32_t);
+	for (i = 0; i < nsg; i++) {
+		sg_props = p;
+		sg_props->sub_graph_id = sg_id[i];
+		sg_props->num_props = 1;
+		p += sizeof(*sg_props);
+		prop_cfg = p;
+		prop_cfg->prop_id = VCPM_PROPERTY_ID_TAG_INFO;
+		prop_cfg->prop_size = sizeof(uint32_t) +
+				      ntags[i] * sizeof(struct vcpm_tag_miid);
+		p += sizeof(*prop_cfg);
+		*(uint32_t *)p = ntags[i];
+		p += sizeof(uint32_t);
+		for (j = 0; j < ntags[i]; j++) {
+			memcpy(p, &tags[i][j], sizeof(struct vcpm_tag_miid));
+			p += sizeof(struct vcpm_tag_miid);
+		}
+	}
+	p = PTR_ALIGN(p, 8);
+
+	param_data = p;
+	param_data->module_instance_id = VCPM_MODULE_INSTANCE_ID;
+	param_data->param_id = VCPM_PARAM_ID_VSID;
+	param_data->param_size = sizeof(*vsid_pl);
+	param_data->error_code = 0;
+	p += APM_MODULE_PARAM_DATA_SIZE;
+	vsid_pl = p;
+	vsid_pl->vsid = vsid;
+	p = PTR_ALIGN(p + sizeof(*vsid_pl), 8);
+
+	if (dir == SNDRV_PCM_STREAM_CAPTURE && tx_channels) {
+		param_data = p;
+		param_data->module_instance_id = VCPM_MODULE_INSTANCE_ID;
+		param_data->param_id = VCPM_PARAM_ID_TX_DEV_PP_CHANNEL_INFO;
+		param_data->param_size = sizeof(*ch_info);
+		param_data->error_code = 0;
+		p += APM_MODULE_PARAM_DATA_SIZE;
+		ch_info = p;
+		ch_info->vsid = vsid;
+		ch_info->num_channels = tx_channels;
+		p = PTR_ALIGN(p + sizeof(*ch_info), 8);
+	}
+
+	if (send_lb_delay) {
+		param_data = p;
+		param_data->module_instance_id = VCPM_MODULE_INSTANCE_ID;
+		param_data->param_id = VCPM_PARAM_ID_VOC_PKT_LOOPBACK_DELAY;
+		param_data->param_size = sizeof(*lb_delay);
+		param_data->error_code = 0;
+		p += APM_MODULE_PARAM_DATA_SIZE;
+		lb_delay = p;
+		lb_delay->vsid = vsid;
+		lb_delay->delay_ms = lb_delay_ms;
+	}
+
+	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
+}
+EXPORT_SYMBOL_GPL(audioreach_send_voice_config);
+
 void audioreach_graph_free_buf(struct q6apm_graph *graph)
 {
 	struct audioreach_graph_data *port;

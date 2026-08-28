@@ -62,6 +62,17 @@ struct q6apm {
 	struct mutex lock;
 	uint32_t state;
 
+	/*
+	 * Voice-call session state for hostless (mailbox) graphs. One call
+	 * system-wide: the VSID selected by the "Voice VSID" control is
+	 * latched on the first voice open and control writes are refused
+	 * while any voice graph is open.
+	 */
+	struct mutex voice_lock;
+	unsigned int voice_open_count;
+	uint32_t voice_vsid_idx;
+	uint32_t voice_vsid;
+
 	struct list_head widget_list;
 	struct idr graph_idr;
 	struct idr graph_info_idr;
@@ -162,6 +173,10 @@ int q6apm_set_real_module_id(struct device *dev, struct q6apm_graph *graph, uint
 int q6apm_get_hw_pointer(struct q6apm_graph *graph, int dir);
 bool q6apm_is_graph_in_push_pull_mode(struct q6apm_graph *graph);
 bool q6apm_is_graph_in_push_pull_mode_from_id(struct device *dev, unsigned int graph_id, int dir);
+bool q6apm_is_voice_graph(struct q6apm_graph *graph, int dir);
+bool q6apm_is_voice_graph_from_id(struct device *dev, unsigned int graph_id, int dir);
+int q6apm_voice_acquire(struct device *dev, uint32_t *vsid);
+void q6apm_voice_release(struct device *dev);
 int q6apm_push_pull_config(struct q6apm_graph *graph, phys_addr_t bphys,
 			   phys_addr_t pphys, uint32_t size);
 

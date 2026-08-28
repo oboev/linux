@@ -704,6 +704,99 @@ bool q6apm_is_graph_in_push_pull_mode(struct q6apm_graph *graph)
 }
 EXPORT_SYMBOL_GPL(q6apm_is_graph_in_push_pull_mode);
 
+/*
+ * A voice (hostless) graph carries exactly one mailbox for its direction and
+ * no shared-memory endpoint of any kind. The positive predicate keeps a
+ * malformed conventional graph from silently classifying as hostless.
+ */
+static bool q6apm_info_is_voice(struct audioreach_graph_info *info, int dir)
+{
+	struct audioreach_container *container;
+	struct audioreach_sub_graph *sgs;
+	struct audioreach_module *module;
+	int mailbox_rx = 0, mailbox_tx = 0, shmem = 0;
+
+	list_for_each_entry(sgs, &info->sg_list, node) {
+		list_for_each_entry(container, &sgs->container_list, node) {
+			list_for_each_entry(module, &container->modules_list, node) {
+				switch (module->module_id) {
+				case MODULE_ID_MAILBOX_RX:
+					mailbox_rx++;
+					break;
+				case MODULE_ID_MAILBOX_TX:
+					mailbox_tx++;
+					break;
+				case MODULE_ID_WR_SHARED_MEM_EP:
+				case MODULE_ID_RD_SHARED_MEM_EP:
+				case MODULE_ID_SH_MEM_PULL_MODE:
+				case MODULE_ID_SH_MEM_PUSH_MODE:
+					shmem++;
+					break;
+				}
+			}
+		}
+	}
+
+	if (shmem)
+		return false;
+	if (dir == SNDRV_PCM_STREAM_PLAYBACK)
+		return mailbox_rx == 1 && !mailbox_tx;
+
+	return mailbox_tx == 1 && !mailbox_rx;
+}
+
+bool q6apm_is_voice_graph(struct q6apm_graph *graph, int dir)
+{
+	return q6apm_info_is_voice(graph->info, dir);
+}
+EXPORT_SYMBOL_GPL(q6apm_is_voice_graph);
+
+bool q6apm_is_voice_graph_from_id(struct device *dev, unsigned int graph_id, int dir)
+{
+	struct q6apm *apm = dev_get_drvdata(dev->parent);
+	struct audioreach_graph_info *info;
+
+	info = idr_find(&apm->graph_info_idr, graph_id);
+	if (!info)
+		return false;
+
+	return q6apm_info_is_voice(info, dir);
+}
+EXPORT_SYMBOL_GPL(q6apm_is_voice_graph_from_id);
+
+static const uint32_t q6apm_voice_vsids[] = {
+	VOICE_VSID_SUB1,
+	VOICE_VSID_SUB2,
+	VOICE_VSID_LB_SUB1,
+	VOICE_VSID_LB_SUB2,
+};
+
+int q6apm_voice_acquire(struct device *dev, uint32_t *vsid)
+{
+	struct q6apm *apm = dev_get_drvdata(dev->parent);
+
+	mutex_lock(&apm->voice_lock);
+	if (apm->voice_open_count == 0)
+		apm->voice_vsid = q6apm_voice_vsids[apm->voice_vsid_idx];
+	apm->voice_open_count++;
+	*vsid = apm->voice_vsid;
+	mutex_unlock(&apm->voice_lock);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(q6apm_voice_acquire);
+
+void q6apm_voice_release(struct device *dev)
+{
+	struct q6apm *apm = dev_get_drvdata(dev->parent);
+
+	mutex_lock(&apm->voice_lock);
+	if (!WARN_ON(apm->voice_open_count == 0))
+		apm->voice_open_count--;
+	mutex_unlock(&apm->voice_lock);
+}
+EXPORT_SYMBOL_GPL(q6apm_voice_release);
+
 static int q6apm_graph_get_module_iid(struct q6apm_graph *graph, uint32_t mid)
 {
 	struct audioreach_module *module;
@@ -804,8 +897,11 @@ int q6apm_graph_start(struct q6apm_graph *graph)
 	struct audioreach_graph *ar_graph = graph->ar_graph;
 	int ret = 0;
 
-	if (ar_graph->start_count == 0)
+	if (ar_graph->start_count == 0) {
 		ret = audioreach_graph_mgmt_cmd(ar_graph, APM_CMD_GRAPH_START);
+		if (ret)
+			return ret;
+	}
 
 	ar_graph->start_count++;
 
@@ -843,10 +939,57 @@ static void q6apm_audio_remove(struct snd_soc_component *component)
 
 #define APM_AUDIO_DRV_NAME "q6apm-audio"
 
+static const char * const q6apm_voice_vsid_texts[] = {
+	"Voice1", "Voice2", "Loopback1", "Loopback2",
+};
+
+static SOC_ENUM_SINGLE_EXT_DECL(q6apm_voice_vsid_enum, q6apm_voice_vsid_texts);
+
+static int q6apm_voice_vsid_get(struct snd_kcontrol *kcontrol,
+				struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *c = snd_kcontrol_chip(kcontrol);
+	struct q6apm *apm = dev_get_drvdata(c->dev);
+
+	ucontrol->value.enumerated.item[0] = apm->voice_vsid_idx;
+
+	return 0;
+}
+
+static int q6apm_voice_vsid_put(struct snd_kcontrol *kcontrol,
+				struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *c = snd_kcontrol_chip(kcontrol);
+	struct q6apm *apm = dev_get_drvdata(c->dev);
+	unsigned int idx = ucontrol->value.enumerated.item[0];
+	int ret = 0;
+
+	if (idx >= ARRAY_SIZE(q6apm_voice_vsids))
+		return -EINVAL;
+
+	mutex_lock(&apm->voice_lock);
+	if (apm->voice_open_count)
+		ret = -EBUSY;
+	else if (apm->voice_vsid_idx != idx) {
+		apm->voice_vsid_idx = idx;
+		ret = 1;
+	}
+	mutex_unlock(&apm->voice_lock);
+
+	return ret;
+}
+
+static const struct snd_kcontrol_new q6apm_controls[] = {
+	SOC_ENUM_EXT("Voice VSID", q6apm_voice_vsid_enum,
+		     q6apm_voice_vsid_get, q6apm_voice_vsid_put),
+};
+
 static const struct snd_soc_component_driver q6apm_audio_component = {
 	.name		= APM_AUDIO_DRV_NAME,
 	.probe		= q6apm_audio_probe,
 	.remove		= q6apm_audio_remove,
+	.controls	= q6apm_controls,
+	.num_controls	= ARRAY_SIZE(q6apm_controls),
 	.remove_order   = SND_SOC_COMP_ORDER_LAST,
 };
 
@@ -863,6 +1006,7 @@ static int apm_probe(gpr_device_t *gdev)
 	dev_set_drvdata(dev, apm);
 
 	mutex_init(&apm->lock);
+	mutex_init(&apm->voice_lock);
 	apm->dev = dev;
 	apm->gdev = gdev;
 	init_waitqueue_head(&apm->wait);
