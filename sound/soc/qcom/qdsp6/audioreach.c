@@ -22,9 +22,18 @@ struct apm_sub_graph_data {
 	struct apm_prop_data sid_data;
 	struct apm_sg_prop_id_scenario_id sid;
 
+	/*
+	 * The VSID slot, created "don't care" - VCPM_PARAM_ID_VSID can only
+	 * assign a session to a subgraph that carries this property (the
+	 * vendor blobs put it on every voice subgraph; a don't-care VSID on
+	 * an audio subgraph is inert).
+	 */
+	struct apm_prop_data vsid_data;
+	uint32_t vsid;
+
 } __packed;
 
-#define APM_SUB_GRAPH_CFG_NPROP	3
+#define APM_SUB_GRAPH_CFG_NPROP	4
 
 struct apm_sub_graph_params  {
 	struct apm_module_param_data param_data;
@@ -358,6 +367,11 @@ static void apm_populate_sub_graph_config(struct apm_sub_graph_data *cfg,
 	cfg->sid_data.prop_id = APM_SUB_GRAPH_PROP_ID_SCENARIO_ID;
 	cfg->sid_data.prop_size = APM_SG_PROP_ID_SID_SIZE;
 	cfg->sid.scenario_id = sg->scenario_id;
+
+	/* VSID, don't care until a voice session claims the subgraph */
+	cfg->vsid_data.prop_id = APM_SUB_GRAPH_PROP_ID_VSID;
+	cfg->vsid_data.prop_size = sizeof(cfg->vsid);
+	cfg->vsid = 0xFFFFFFFF;
 }
 
 static void apm_populate_module_prop_obj(struct apm_mod_prop_obj *obj,
@@ -465,6 +479,145 @@ static void audioreach_populate_graph(struct q6apm *apm,
 	}
 }
 
+/* The voice roles VCPM can be told about, index-aligned with the counters */
+static const uint32_t audioreach_voice_tags[] = {
+	VOICE_MOD_TAG_ID_ENCODER,
+	VOICE_MOD_TAG_ID_TX_MAILBOX,
+	VOICE_MOD_TAG_ID_DECODER,
+	VOICE_MOD_TAG_ID_RX_MAILBOX,
+	VOICE_MOD_TAG_ID_TX_SMART_SYNC,
+};
+
+enum { AR_VROLE_ENC, AR_VROLE_TX_MB, AR_VROLE_DEC, AR_VROLE_RX_MB, AR_VROLE_SYNC };
+
+static int audioreach_voice_role(uint32_t module_id)
+{
+	switch (module_id) {
+	case MODULE_ID_PLACEHOLDER_ENCODER:
+		return AR_VROLE_ENC;
+	case MODULE_ID_MAILBOX_TX:
+		return AR_VROLE_TX_MB;
+	case MODULE_ID_PLACEHOLDER_DECODER:
+		return AR_VROLE_DEC;
+	case MODULE_ID_MAILBOX_RX:
+		return AR_VROLE_RX_MB;
+	case MODULE_ID_SMART_SYNC:
+		return AR_VROLE_SYNC;
+	default:
+		return -1;
+	}
+}
+
+#define AR_VOICE_MAX_SG		4
+#define AR_VOICE_MAX_TAGS	ARRAY_SIZE(audioreach_voice_tags)
+
+struct audioreach_voice_roles {
+	uint32_t sg_id[AR_VOICE_MAX_SG];
+	struct vcpm_tag_miid tags[AR_VOICE_MAX_SG][AR_VOICE_MAX_TAGS];
+	int ntags[AR_VOICE_MAX_SG];
+	int rolecnt[AR_VOICE_MAX_TAGS];
+	int nsg;
+};
+
+static int audioreach_collect_voice_roles(const struct audioreach_graph_info *info,
+					  struct audioreach_voice_roles *r)
+{
+	struct audioreach_container *container;
+	struct audioreach_sub_graph *sgs;
+	struct audioreach_module *module;
+	int role;
+
+	memset(r, 0, sizeof(*r));
+
+	list_for_each_entry(sgs, &info->sg_list, node) {
+		int idx = -1;
+
+		list_for_each_entry(container, &sgs->container_list, node) {
+			list_for_each_entry(module, &container->modules_list, node) {
+				role = audioreach_voice_role(module->module_id);
+				if (role < 0)
+					continue;
+				/* a duplicate role makes the table nonsense */
+				if (r->rolecnt[role]++)
+					return -EINVAL;
+				if (idx < 0) {
+					if (r->nsg == AR_VOICE_MAX_SG)
+						return -EINVAL;
+					idx = r->nsg++;
+					r->sg_id[idx] = sgs->sub_graph_id;
+				}
+				r->tags[idx][r->ntags[idx]].tag_id =
+						audioreach_voice_tags[role];
+				r->tags[idx][r->ntags[idx]].module_iid =
+						module->instance_id;
+				r->ntags[idx]++;
+			}
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * VCPM's per-subgraph role tables ride inside GRAPH_OPEN, the way the vendor
+ * blobs deliver them - VCPM learns the session's roles at open.
+ */
+static int audioreach_voice_cfg_size(const struct audioreach_graph_info *info)
+{
+	struct audioreach_voice_roles r;
+	int sz, i;
+
+	if (audioreach_collect_voice_roles(info, &r) || !r.nsg)
+		return 0;
+
+	sz = APM_MODULE_PARAM_DATA_SIZE + sizeof(uint32_t);
+	for (i = 0; i < r.nsg; i++)
+		sz += sizeof(struct vcpm_cfg_sg_props) +
+		      sizeof(struct vcpm_prop_cfg) + sizeof(uint32_t) +
+		      r.ntags[i] * sizeof(struct vcpm_tag_miid);
+
+	return ALIGN(sz, 8);
+}
+
+static void audioreach_fill_voice_cfg(const struct audioreach_graph_info *info,
+				      void *p, int vc_sz)
+{
+	struct apm_module_param_data *param_data;
+	struct vcpm_cfg_sg_props *sg_props;
+	struct audioreach_voice_roles r;
+	struct vcpm_prop_cfg *prop_cfg;
+	int i, j;
+
+	if (audioreach_collect_voice_roles(info, &r) || !r.nsg)
+		return;
+
+	param_data = p;
+	param_data->module_instance_id = VCPM_MODULE_INSTANCE_ID;
+	param_data->param_id = VCPM_PARAM_ID_VOICE_CONFIG;
+	param_data->param_size = vc_sz - APM_MODULE_PARAM_DATA_SIZE;
+	param_data->error_code = 0;
+	p += APM_MODULE_PARAM_DATA_SIZE;
+	*(uint32_t *)p = r.nsg;
+	p += sizeof(uint32_t);
+	for (i = 0; i < r.nsg; i++) {
+		sg_props = p;
+		sg_props->sub_graph_id = r.sg_id[i];
+		sg_props->num_props = 1;
+		p += sizeof(*sg_props);
+		prop_cfg = p;
+		prop_cfg->prop_id = VCPM_PROPERTY_ID_TAG_INFO;
+		prop_cfg->prop_size = sizeof(uint32_t) +
+				      r.ntags[i] * sizeof(struct vcpm_tag_miid);
+		p += sizeof(*prop_cfg);
+		*(uint32_t *)p = r.ntags[i];
+		p += sizeof(uint32_t);
+		for (j = 0; j < r.ntags[i]; j++) {
+			memcpy(p, &r.tags[i][j], sizeof(struct vcpm_tag_miid));
+			p += sizeof(struct vcpm_tag_miid);
+		}
+	}
+}
+
 void *audioreach_alloc_graph_pkt(struct q6apm *apm,
 				 const struct audioreach_graph_info *info)
 {
@@ -519,6 +672,7 @@ void *audioreach_alloc_graph_pkt(struct q6apm *apm,
 	mc_sz =	APM_MOD_CONN_PSIZE(mcon, num_connections);
 
 	payload_size = sg_sz + cont_sz + ml_sz + mp_sz + mc_sz;
+	payload_size += audioreach_voice_cfg_size(info);
 	pkt = audioreach_alloc_apm_cmd_pkt(payload_size, APM_CMD_GRAPH_OPEN, 0);
 	if (IS_ERR(pkt))
 		return pkt;
@@ -571,6 +725,15 @@ void *audioreach_alloc_graph_pkt(struct q6apm *apm,
 	p += mc_sz;
 
 	audioreach_populate_graph(apm, info, &params, sg_list, num_sub_graphs);
+
+	{
+		int vc_sz = audioreach_voice_cfg_size(info);
+
+		if (vc_sz)
+			audioreach_fill_voice_cfg(info,
+					(void *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE +
+					payload_size - vc_sz, vc_sz);
+	}
 
 	return pkt;
 }
@@ -1436,187 +1599,129 @@ int audioreach_set_media_format(struct q6apm_graph *graph,
 }
 EXPORT_SYMBOL_GPL(audioreach_set_media_format);
 
-/* The voice roles VCPM can be told about, index-aligned with the counters */
-static const uint32_t audioreach_voice_tags[] = {
-	VOICE_MOD_TAG_ID_ENCODER,
-	VOICE_MOD_TAG_ID_TX_MAILBOX,
-	VOICE_MOD_TAG_ID_DECODER,
-	VOICE_MOD_TAG_ID_RX_MAILBOX,
-	VOICE_MOD_TAG_ID_TX_SMART_SYNC,
-};
-
-enum { AR_VROLE_ENC, AR_VROLE_TX_MB, AR_VROLE_DEC, AR_VROLE_RX_MB, AR_VROLE_SYNC };
-
-static int audioreach_voice_role(uint32_t module_id)
+/*
+ * Voice graphs: only the MFC takes the runtime format. The placeholder
+ * codecs belong to VCPM - it resolves them to the network's vocoder - and
+ * pushing a PCM media format at them derails that; the mailboxes and
+ * smart-sync configure themselves from the session.
+ */
+int audioreach_voice_media_format(struct q6apm_graph *graph,
+				  struct audioreach_module_config *cfg)
 {
-	switch (module_id) {
-	case MODULE_ID_PLACEHOLDER_ENCODER:
-		return AR_VROLE_ENC;
-	case MODULE_ID_MAILBOX_TX:
-		return AR_VROLE_TX_MB;
-	case MODULE_ID_PLACEHOLDER_DECODER:
-		return AR_VROLE_DEC;
-	case MODULE_ID_MAILBOX_RX:
-		return AR_VROLE_RX_MB;
-	case MODULE_ID_SMART_SYNC:
-		return AR_VROLE_SYNC;
-	default:
-		return -1;
+	struct audioreach_graph_info *info = graph->info;
+	struct audioreach_container *container;
+	struct audioreach_sub_graph *sgs;
+	struct audioreach_module *module;
+	int ret;
+
+	list_for_each_entry(sgs, &info->sg_list, node) {
+		list_for_each_entry(container, &sgs->container_list, node) {
+			list_for_each_entry(module, &container->modules_list, node) {
+				if (module->module_id != MODULE_ID_MFC)
+					continue;
+				ret = audioreach_mfc_set_media_format(graph, module, cfg);
+				if (ret)
+					return ret;
+			}
+		}
 	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(audioreach_voice_media_format);
+
+static int audioreach_send_vcpm_param(struct q6apm_graph *graph, uint32_t pid,
+				      void *payload, int size)
+{
+	struct apm_module_param_data *param_data;
+	int ret;
+	void *p;
+
+	struct gpr_pkt *pkt __free(kfree) =
+		audioreach_alloc_apm_cmd_pkt(APM_MODULE_PARAM_DATA_SIZE + size,
+					     APM_CMD_SET_CFG, 0);
+	if (IS_ERR(pkt))
+		return PTR_ERR(pkt);
+
+	p = (void *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
+	param_data = p;
+	param_data->module_instance_id = VCPM_MODULE_INSTANCE_ID;
+	param_data->param_id = pid;
+	param_data->param_size = size;
+	param_data->error_code = 0;
+	memcpy(p + APM_MODULE_PARAM_DATA_SIZE, payload, size);
+
+	ret = q6apm_send_cmd_sync(graph->apm, pkt, 0);
+	dev_dbg(graph->dev, "VCPM param %#x (%d bytes): %d\n", pid, size, ret);
+
+	return ret;
 }
 
-#define AR_VOICE_MAX_SG		4
-#define AR_VOICE_MAX_TAGS	ARRAY_SIZE(audioreach_voice_tags)
-
 /*
- * Hand VCPM (static instance 0x4) everything it needs to run a voice-call
- * session on this graph: which module instance plays which role (derived
- * from the module IDs, validated - the vendor's own tables in the ACDB
- * carry exactly these pairs), the Voice System ID, the TX device channel
- * count, and the vocoder-packet loopback delay for loopback VSIDs.
+ * The role tables ride inside GRAPH_OPEN (audioreach_fill_voice_cfg), the way
+ * the vendor delivers them. Here: validate the graph's roles for the
+ * direction, then hand VCPM the session parameters - the VSID, the TX device
+ * channel count, and the vocoder-packet loopback delay for loopback VSIDs.
  */
 int audioreach_send_voice_config(struct q6apm_graph *graph, int dir,
 				 uint32_t vsid, uint32_t tx_channels,
 				 uint32_t lb_delay_ms)
 {
-	struct audioreach_graph_info *info = graph->info;
-	struct vcpm_tag_miid tags[AR_VOICE_MAX_SG][AR_VOICE_MAX_TAGS];
-	struct audioreach_container *container;
-	struct apm_module_param_data *param_data;
-	struct audioreach_sub_graph *sgs;
-	struct audioreach_module *module;
-	struct vcpm_cfg_sg_props *sg_props;
-	struct vcpm_prop_cfg *prop_cfg;
-	struct vcpm_tx_ch_info *ch_info;
-	struct vcpm_param_vsid *vsid_pl;
-	struct vcpm_lb_delay *lb_delay;
-	uint32_t sg_id[AR_VOICE_MAX_SG];
-	int ntags[AR_VOICE_MAX_SG] = {};
-	int rolecnt[AR_VOICE_MAX_TAGS] = {};
-	int payload_size, vc_size;
-	int nsg = 0, i, j, role;
+	struct audioreach_voice_roles r;
 	bool send_lb_delay;
-	void *p;
+	int ret;
 
-	/* collect the voice roles, subgraph by subgraph */
-	list_for_each_entry(sgs, &info->sg_list, node) {
-		int idx = -1;
+	ret = audioreach_collect_voice_roles(graph->info, &r);
+	if (ret)
+		return ret;
 
-		list_for_each_entry(container, &sgs->container_list, node) {
-			list_for_each_entry(module, &container->modules_list, node) {
-				role = audioreach_voice_role(module->module_id);
-				if (role < 0)
-					continue;
-				/* a duplicate role makes the table nonsense */
-				if (rolecnt[role]++)
-					return -EINVAL;
-				if (idx < 0) {
-					if (nsg == AR_VOICE_MAX_SG)
-						return -EINVAL;
-					idx = nsg++;
-					sg_id[idx] = sgs->sub_graph_id;
-				}
-				tags[idx][ntags[idx]].tag_id = audioreach_voice_tags[role];
-				tags[idx][ntags[idx]].module_iid = module->instance_id;
-				ntags[idx]++;
-			}
-		}
-	}
-
-	/* the direction's mailbox and codec role must both be present */
 	if (dir == SNDRV_PCM_STREAM_PLAYBACK) {
-		if (!rolecnt[AR_VROLE_RX_MB] || !rolecnt[AR_VROLE_DEC])
+		if (!r.rolecnt[AR_VROLE_RX_MB] || !r.rolecnt[AR_VROLE_DEC])
 			return -EINVAL;
 	} else {
-		if (!rolecnt[AR_VROLE_TX_MB] || !rolecnt[AR_VROLE_ENC])
+		if (!r.rolecnt[AR_VROLE_TX_MB] || !r.rolecnt[AR_VROLE_ENC])
 			return -EINVAL;
 	}
 
 	send_lb_delay = lb_delay_ms &&
 			(vsid == VOICE_VSID_LB_SUB1 || vsid == VOICE_VSID_LB_SUB2);
 
-	vc_size = sizeof(uint32_t);
-	for (i = 0; i < nsg; i++)
-		vc_size += sizeof(*sg_props) + sizeof(*prop_cfg) +
-			   sizeof(uint32_t) + ntags[i] * sizeof(struct vcpm_tag_miid);
+	{
+		struct vcpm_param_vsid vp = { .vsid = vsid };
 
-	payload_size = ALIGN(APM_MODULE_PARAM_DATA_SIZE + vc_size, 8) +
-		       ALIGN(APM_MODULE_PARAM_DATA_SIZE + sizeof(*vsid_pl), 8);
-	if (dir == SNDRV_PCM_STREAM_CAPTURE && tx_channels)
-		payload_size += ALIGN(APM_MODULE_PARAM_DATA_SIZE + sizeof(*ch_info), 8);
-	if (send_lb_delay)
-		payload_size += ALIGN(APM_MODULE_PARAM_DATA_SIZE + sizeof(*lb_delay), 8);
-
-	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(payload_size,
-									 APM_CMD_SET_CFG, 0);
-	if (IS_ERR(pkt))
-		return PTR_ERR(pkt);
-
-	p = (void *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
-
-	param_data = p;
-	param_data->module_instance_id = VCPM_MODULE_INSTANCE_ID;
-	param_data->param_id = VCPM_PARAM_ID_VOICE_CONFIG;
-	param_data->param_size = vc_size;
-	param_data->error_code = 0;
-	p += APM_MODULE_PARAM_DATA_SIZE;
-	*(uint32_t *)p = nsg;
-	p += sizeof(uint32_t);
-	for (i = 0; i < nsg; i++) {
-		sg_props = p;
-		sg_props->sub_graph_id = sg_id[i];
-		sg_props->num_props = 1;
-		p += sizeof(*sg_props);
-		prop_cfg = p;
-		prop_cfg->prop_id = VCPM_PROPERTY_ID_TAG_INFO;
-		prop_cfg->prop_size = sizeof(uint32_t) +
-				      ntags[i] * sizeof(struct vcpm_tag_miid);
-		p += sizeof(*prop_cfg);
-		*(uint32_t *)p = ntags[i];
-		p += sizeof(uint32_t);
-		for (j = 0; j < ntags[i]; j++) {
-			memcpy(p, &tags[i][j], sizeof(struct vcpm_tag_miid));
-			p += sizeof(struct vcpm_tag_miid);
-		}
+		ret = audioreach_send_vcpm_param(graph, VCPM_PARAM_ID_VSID,
+						 &vp, sizeof(vp));
+		if (ret)
+			return ret;
 	}
-	p = PTR_ALIGN(p, 8);
-
-	param_data = p;
-	param_data->module_instance_id = VCPM_MODULE_INSTANCE_ID;
-	param_data->param_id = VCPM_PARAM_ID_VSID;
-	param_data->param_size = sizeof(*vsid_pl);
-	param_data->error_code = 0;
-	p += APM_MODULE_PARAM_DATA_SIZE;
-	vsid_pl = p;
-	vsid_pl->vsid = vsid;
-	p = PTR_ALIGN(p + sizeof(*vsid_pl), 8);
 
 	if (dir == SNDRV_PCM_STREAM_CAPTURE && tx_channels) {
-		param_data = p;
-		param_data->module_instance_id = VCPM_MODULE_INSTANCE_ID;
-		param_data->param_id = VCPM_PARAM_ID_TX_DEV_PP_CHANNEL_INFO;
-		param_data->param_size = sizeof(*ch_info);
-		param_data->error_code = 0;
-		p += APM_MODULE_PARAM_DATA_SIZE;
-		ch_info = p;
-		ch_info->vsid = vsid;
-		ch_info->num_channels = tx_channels;
-		p = PTR_ALIGN(p + sizeof(*ch_info), 8);
+		struct vcpm_tx_ch_info ci = {
+			.vsid = vsid,
+			.num_channels = tx_channels,
+		};
+
+		ret = audioreach_send_vcpm_param(graph,
+				VCPM_PARAM_ID_TX_DEV_PP_CHANNEL_INFO,
+				&ci, sizeof(ci));
+		if (ret)
+			return ret;
 	}
 
 	if (send_lb_delay) {
-		param_data = p;
-		param_data->module_instance_id = VCPM_MODULE_INSTANCE_ID;
-		param_data->param_id = VCPM_PARAM_ID_VOC_PKT_LOOPBACK_DELAY;
-		param_data->param_size = sizeof(*lb_delay);
-		param_data->error_code = 0;
-		p += APM_MODULE_PARAM_DATA_SIZE;
-		lb_delay = p;
-		lb_delay->vsid = vsid;
-		lb_delay->delay_ms = lb_delay_ms;
+		struct vcpm_lb_delay ld = {
+			.vsid = vsid,
+			.delay_ms = lb_delay_ms,
+		};
+
+		ret = audioreach_send_vcpm_param(graph,
+				VCPM_PARAM_ID_VOC_PKT_LOOPBACK_DELAY,
+				&ld, sizeof(ld));
+		if (ret)
+			return ret;
 	}
 
-	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
+	return 0;
 }
 EXPORT_SYMBOL_GPL(audioreach_send_voice_config);
 

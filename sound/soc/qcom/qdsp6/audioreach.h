@@ -521,6 +521,7 @@ struct apm_sg_prop_id_direction {
 #define APM_SG_PROP_ID_DIR_SIZE		4
 
 #define APM_SUB_GRAPH_PROP_ID_SCENARIO_ID	0x08001010
+#define APM_SUB_GRAPH_PROP_ID_VSID		0x080010CC
 #define APM_SUB_GRAPH_SID_AUDIO_PLAYBACK	0x1
 #define APM_SUB_GRAPH_SID_AUDIO_RECORD		0x2
 #define APM_SUB_GRAPH_SID_AUDIO_VOICE_CALL	0x3
@@ -971,6 +972,8 @@ struct audioreach_module_config {
 int audioreach_send_voice_config(struct q6apm_graph *graph, int dir,
 				 uint32_t vsid, uint32_t tx_channels,
 				 uint32_t lb_delay_ms);
+int audioreach_voice_media_format(struct q6apm_graph *graph,
+				  struct audioreach_module_config *cfg);
 void *audioreach_alloc_apm_cmd_pkt(int pkt_size, uint32_t opcode, uint32_t
 				    token);
 void audioreach_set_default_channel_mapping(u8 *ch_map, int num_channels);

@@ -285,7 +285,7 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
 			return ret;
 		}
 
-		ret = q6apm_graph_media_format_pcm(prtd->graph, &cfg);
+		ret = audioreach_voice_media_format(prtd->graph, &cfg);
 		if (ret) {
 			dev_err(dev, "Failed to set media format %d\n", ret);
 			return ret;
