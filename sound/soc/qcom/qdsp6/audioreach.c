@@ -1611,6 +1611,11 @@ EXPORT_SYMBOL_GPL(audioreach_set_media_format);
  * codecs belong to VCPM - it resolves them to the network's vocoder - and
  * pushing a PCM media format at them derails that; the mailboxes and
  * smart-sync configure themselves from the session.
+ *
+ * A data-logging module is the exception: it carries no runtime format at all,
+ * only the identity a DIAG capture selects it by, and it has to be enabled and
+ * given that identity or it logs nothing. Conventional graphs get this from
+ * q6apm_graph_media_format_pcm(); a hostless voice graph never runs that walk.
  */
 int audioreach_voice_media_format(struct q6apm_graph *graph,
 				  struct audioreach_module_config *cfg)
@@ -1624,9 +1629,17 @@ int audioreach_voice_media_format(struct q6apm_graph *graph,
 	list_for_each_entry(sgs, &info->sg_list, node) {
 		list_for_each_entry(container, &sgs->container_list, node) {
 			list_for_each_entry(module, &container->modules_list, node) {
-				if (module->module_id != MODULE_ID_MFC)
+				switch (module->module_id) {
+				case MODULE_ID_MFC:
+					ret = audioreach_mfc_set_media_format(graph, module,
+									      cfg);
+					break;
+				case MODULE_ID_DATA_LOGGING:
+					ret = audioreach_set_media_format(graph, module, cfg);
+					break;
+				default:
 					continue;
-				ret = audioreach_mfc_set_media_format(graph, module, cfg);
+				}
 				if (ret)
 					return ret;
 			}
