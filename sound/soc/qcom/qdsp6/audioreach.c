@@ -642,7 +642,15 @@ void *audioreach_alloc_graph_pkt(struct q6apm *apm,
 	void *p;
 
 	sg_list = &info->sg_list;
-	ml_sz = 0;
+	/*
+	 * One apm_module_list_params header covers the whole parameter, however
+	 * many containers it goes on to describe, so count it once here rather
+	 * than once per container. Counting it per container makes the module
+	 * list declare 20 bytes more than are written for every container past
+	 * the first, and the DSP refuses a graph open whose module list runs
+	 * that far past its content.
+	 */
+	ml_sz = sizeof(struct apm_module_list_params);
 
 	/* add FE-BE connections */
 	if (info->dst_mod_inst_id && info->src_mod_inst_id)
@@ -653,8 +661,7 @@ void *audioreach_alloc_graph_pkt(struct q6apm *apm,
 		list_for_each_entry(container, &sgs->container_list, node) {
 			num_containers++;
 			num_modules += container->num_modules;
-			ml_sz = ml_sz + sizeof(struct apm_module_list_params) +
-				APM_MOD_LIST_OBJ_PSIZE(mlobj, container->num_modules);
+			ml_sz += APM_MOD_LIST_OBJ_PSIZE(mlobj, container->num_modules);
 
 			list_for_each_entry(module, &container->modules_list, node) {
 				num_connections += module->num_connections;
