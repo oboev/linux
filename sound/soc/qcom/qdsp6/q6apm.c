@@ -38,10 +38,62 @@ int q6apm_send_cmd_sync(struct q6apm *apm, const struct gpr_pkt *pkt,
 					NULL, &apm->wait, pkt, rsp_opcode);
 }
 
+static bool q6apm_info_is_voice(struct audioreach_graph_info *info, int dir);
+
+static bool audioreach_info_has_module(const struct audioreach_graph_info *info, uint32_t iid)
+{
+	struct audioreach_container *container;
+	struct audioreach_sub_graph *sgs;
+	struct audioreach_module *module;
+
+	list_for_each_entry(sgs, &info->sg_list, node)
+		list_for_each_entry(container, &sgs->container_list, node)
+			list_for_each_entry(module, &container->modules_list, node)
+				if (module->instance_id == iid)
+					return true;
+	return false;
+}
+
+/*
+ * VCPM is told about a voice graph exactly once, at the
+ * front end's GRAPH_OPEN; the RX backend (the I2S sink) opens later, at the
+ * backend DAI's prepare, in an open that carries the FE->BE link and that APM
+ * does not forward to any proxy. The vendor opens stream, post-processing and
+ * device sub-graphs in one command. So: for a voice RX graph, find the
+ * backend it is routed to (the graph info that holds a link FROM one of this
+ * graph's modules - audioreach_connect_sub_graphs() put it there) and, if that
+ * backend is not open yet, open it in the same GRAPH_OPEN. Returns NULL for
+ * every other graph, and for a backend that is already open (today's path).
+ * Caller holds no apm lock.
+ */
+static struct audioreach_graph_info *q6apm_voice_rx_backend_info(struct q6apm *apm,
+								 struct audioreach_graph_info *info)
+{
+	struct audioreach_graph_info *cand;
+	int id;
+
+	if (!q6apm_info_is_voice(info, SNDRV_PCM_STREAM_PLAYBACK))
+		return NULL;
+
+	mutex_lock(&apm->lock);
+	idr_for_each_entry(&apm->graph_info_idr, cand, id) {
+		if (cand == info || !cand->src_mod_inst_id || !cand->dst_mod_inst_id)
+			continue;
+		if (!audioreach_info_has_module(info, cand->src_mod_inst_id))
+			continue;
+		if (idr_find(&apm->graph_idr, id))
+			cand = NULL;	/* already open: nothing to carry */
+		break;
+	}
+	mutex_unlock(&apm->lock);
+
+	return cand;
+}
+
 static struct audioreach_graph *q6apm_get_audioreach_graph(struct q6apm *apm, uint32_t graph_id)
 {
-	struct audioreach_graph_info *info;
-	struct audioreach_graph *graph;
+	struct audioreach_graph_info *info, *be_info;
+	struct audioreach_graph *graph, *be = NULL;
 	int id;
 
 	mutex_lock(&apm->lock);
@@ -66,10 +118,25 @@ static struct audioreach_graph *q6apm_get_audioreach_graph(struct q6apm *apm, ui
 	graph->info = info;
 	graph->id = graph_id;
 
-	graph->graph = audioreach_alloc_graph_pkt(apm, info);
+	be_info = q6apm_voice_rx_backend_info(apm, info);
+	if (be_info) {
+		be = kzalloc_obj(*be);
+		if (!be) {
+			kfree(graph);
+			return ERR_PTR(-ENOMEM);
+		}
+		be->apm = apm;
+		be->info = be_info;
+		be->id = be_info->id;
+		graph->adopted = be;
+		graph->graph = audioreach_alloc_graph_pkt_merged(apm, info, be_info);
+	} else {
+		graph->graph = audioreach_alloc_graph_pkt(apm, info);
+	}
 	if (IS_ERR(graph->graph)) {
 		void *err = graph->graph;
 
+		kfree(be);
 		kfree(graph);
 		return ERR_CAST(err);
 	}
@@ -87,7 +154,34 @@ static struct audioreach_graph *q6apm_get_audioreach_graph(struct q6apm *apm, ui
 
 	kref_init(&graph->refcount);
 
-	q6apm_send_cmd_sync(apm, graph->graph, 0);
+	if (be) {
+		mutex_lock(&apm->lock);
+		id = idr_alloc(&apm->graph_idr, be, be->id, be->id + 1, GFP_KERNEL);
+		if (id < 0)
+			idr_remove(&apm->graph_idr, graph_id);
+		mutex_unlock(&apm->lock);
+		if (id < 0) {
+			dev_err(apm->dev, "Unable to register backend graph %d beside graph %d (%d)\n",
+				be->id, graph_id, id);
+			kfree(graph->graph);
+			kfree(graph);
+			kfree(be);
+			return ERR_PTR(id);
+		}
+		kref_init(&be->refcount);
+	}
+
+	graph->open_result.rc = q6apm_send_cmd_sync(apm, graph->graph, 0);
+	graph->open_result.opcode = apm->result.opcode;
+	graph->open_result.status = apm->result.status;
+	graph->open_result.seen = true;
+
+	if (be) {
+		be->open_result = graph->open_result;
+		dev_dbg(apm->dev, "GRAPH_OPEN graph %d opened backend graph %d with it: rc %d opcode 0x%x status %u\n",
+			 graph_id, be->id, graph->open_result.rc,
+			 graph->open_result.opcode, graph->open_result.status);
+	}
 
 	return graph;
 }
@@ -123,7 +217,7 @@ static int audioreach_graph_mgmt_cmd(struct audioreach_graph *graph, uint32_t op
 
 static void q6apm_put_audioreach_graph(struct kref *ref)
 {
-	struct audioreach_graph *graph;
+	struct audioreach_graph *graph, *adopted;
 	struct q6apm *apm;
 
 	graph = container_of(ref, struct audioreach_graph, refcount);
@@ -135,8 +229,13 @@ static void q6apm_put_audioreach_graph(struct kref *ref)
 	graph = idr_remove(&apm->graph_idr, graph->id);
 	mutex_unlock(&apm->lock);
 
+	adopted = graph->adopted;
 	kfree(graph->graph);
 	kfree(graph);
+
+	/* the backend this graph opened in its own GRAPH_OPEN */
+	if (adopted)
+		kref_put(&adopted->refcount, q6apm_put_audioreach_graph);
 }
 
 

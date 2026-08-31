@@ -987,6 +987,9 @@ void *audioreach_alloc_pkt(int payload_size, uint32_t opcode,
 			   uint32_t dest_port);
 void *audioreach_alloc_graph_pkt(struct q6apm *apm,
 				 const struct audioreach_graph_info *info);
+void *audioreach_alloc_graph_pkt_merged(struct q6apm *apm,
+					const struct audioreach_graph_info *info,
+					const struct audioreach_graph_info *extra);
 /* Topology specific */
 int audioreach_tplg_init(struct snd_soc_component *component);
 

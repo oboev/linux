@@ -93,6 +93,18 @@ struct audioreach_graph_data {
 	atomic_t hw_ptr;
 };
 
+/*
+ * What the DSP answered to this graph's GRAPH_OPEN, recorded as it arrives:
+ * the open is issued from paths that discard their return value, and later
+ * opens may need to know whether this graph is genuinely open on the DSP.
+ */
+struct audioreach_graph_cmd_result {
+	bool seen;
+	int rc;
+	uint32_t opcode;
+	uint32_t status;
+};
+
 struct audioreach_graph {
 	struct audioreach_graph_info *info;
 	uint32_t id;
@@ -102,6 +114,14 @@ struct audioreach_graph {
 	void *graph;
 	struct kref refcount;
 	struct q6apm *apm;
+	struct audioreach_graph_cmd_result open_result;
+	/*
+	 * The backend graph this (voice RX) graph opened in its own
+	 * GRAPH_OPEN. Registered in graph_idr under the backend's id so the
+	 * backend DAI takes a reference instead of opening; this graph holds
+	 * the initial reference and drops it when it closes.
+	 */
+	struct audioreach_graph *adopted;
 };
 
 typedef void (*q6apm_cb) (uint32_t opcode, uint32_t token,
