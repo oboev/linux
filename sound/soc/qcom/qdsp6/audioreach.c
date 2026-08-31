@@ -835,6 +835,66 @@ static void audioreach_fill_ctrl_link(struct apm_ctrl_link_obj *obj,
 	obj->heap_id = APM_CTRL_LINK_HEAP_ID_DEFAULT;
 }
 
+/*
+ * A topology connection is packed in the first open that holds
+ * both of its ends. The vendor's ACDB declares a cross-sub-graph link in both
+ * sub-graphs' connection lists and the ADSP resolves it at whichever open
+ * comes second (stock: the RX device splitter's echo-reference link into the
+ * TX sample slip, registered at the TX open). The kernel's topology declares
+ * a connection on its source module only, so an open whose modules are the
+ * DESTINATION of a link declared in an already-open graph has to carry that
+ * link itself; without it the sample slip's reference input never opens and
+ * the module skips every process call ("port 1 not started").
+ */
+static int audioreach_cross_open_links(struct q6apm *apm,
+				       const struct audioreach_graph_info *const *infos,
+				       int ninfo, struct apm_module_conn_obj *links,
+				       int *from_gid, int max)
+{
+	struct audioreach_graph_info *cand;
+	struct audioreach_container *container;
+	struct audioreach_sub_graph *sgs;
+	struct audioreach_module *module;
+	struct audioreach_graph *g;
+	int id, i, pn, n = 0;
+
+	mutex_lock(&apm->lock);
+	idr_for_each_entry(&apm->graph_info_idr, cand, id) {
+		for (i = 0; i < ninfo; i++)
+			if (infos[i] == cand)
+				break;
+		if (i < ninfo)
+			continue;	/* part of this open */
+		g = idr_find(&apm->graph_idr, id);
+		if (!g || !g->open_result.seen || g->open_result.rc || g->open_result.status)
+			continue;	/* not open (or not accepted) */
+		list_for_each_entry(sgs, &cand->sg_list, node)
+		list_for_each_entry(container, &sgs->container_list, node)
+		list_for_each_entry(module, &container->modules_list, node) {
+			for (pn = 0; pn < module->max_op_port && pn < AR_MAX_MOD_LINKS; pn++) {
+				uint32_t dst = module->dst_mod_inst_id[pn];
+
+				if (!dst || n >= max)
+					continue;
+				for (i = 0; i < ninfo; i++)
+					if (audioreach_info_has_iid(infos[i], dst))
+						break;
+				if (i == ninfo)
+					continue;
+				links[n].src_mod_inst_id = module->instance_id;
+				links[n].src_mod_op_port_id = module->src_mod_op_port_id[pn];
+				links[n].dst_mod_inst_id = dst;
+				links[n].dst_mod_ip_port_id = module->dst_mod_ip_port_id[pn];
+				from_gid[n] = id;
+				n++;
+			}
+		}
+	}
+	mutex_unlock(&apm->lock);
+
+	return n;
+}
+
 static void *__audioreach_alloc_graph_pkt(struct q6apm *apm,
 					  const struct audioreach_graph_info *const *infos,
 					  int ninfo)
@@ -853,6 +913,9 @@ static void *__audioreach_alloc_graph_pkt(struct q6apm *apm,
 	struct audioreach_module *module;
 	struct audioreach_sub_graph *sgs;
 	struct apm_mod_list_obj *mlobj;
+	struct apm_module_conn_obj cross[AR_MAX_MOD_LINKS];
+	int cross_gid[AR_MAX_MOD_LINKS];
+	int own_connections, ncross, i;
 	int num_connections = 0;
 	int num_containers = 0;
 	int num_sub_graphs = 0;
@@ -892,6 +955,12 @@ static void *__audioreach_alloc_graph_pkt(struct q6apm *apm,
 			}
 		}
 	}
+
+	/* links declared in already-open graphs that end here */
+	own_connections = num_connections;
+	ncross = audioreach_cross_open_links(apm, infos, ninfo, cross, cross_gid,
+					     ARRAY_SIZE(cross));
+	num_connections += ncross;
 
 	num_modules_list = num_containers;
 	sg_sz = APM_SUB_GRAPH_PSIZE(sg_params, num_sub_graphs);
@@ -973,6 +1042,13 @@ static void *__audioreach_alloc_graph_pkt(struct q6apm *apm,
 	}
 
 	audioreach_populate_graph(apm, infos, ninfo, &params);
+
+	for (i = 0; i < ncross; i++) {
+		params.mod_conn_list_data->conn_obj[own_connections + i] = cross[i];
+		dev_dbg(apm->dev, "GRAPH_OPEN graph %d carries the cross-open link 0x%x.out%u -> 0x%x.in%u from open graph %d\n",
+			 info->id, cross[i].src_mod_inst_id, cross[i].src_mod_op_port_id,
+			 cross[i].dst_mod_inst_id, cross[i].dst_mod_ip_port_id, cross_gid[i]);
+	}
 
 	{
 		int vc_sz = audioreach_voice_cfg_size(info);
