@@ -118,6 +118,42 @@ struct apm_mod_conn_list_params {
 
 #define APM_MOD_CONN_PSIZE(p, n) ALIGN(struct_size(p, conn_obj, n), 8)
 
+/*
+ * Module control links (apm_module_api.h). The vendor's
+ * voice graph control-links each vocoder mailbox to its physical hardware
+ * endpoint with INTENT_ID_MODULE_INSTANCE_INFO - that is how the mailbox
+ * learns the endpoint's instance id, which VCPM asks it for (GET_CFG
+ * 0x08001085) and needs non-zero in both directions before it treats the
+ * graph as complete. This port's graph opens never carried one.
+ */
+#define APM_PARAM_ID_MODULE_CTRL_LINK_CFG	0x08001061
+#define APM_MODULE_PROP_ID_CTRL_LINK_INTENT_LIST	0x08001062
+#define APM_MODULE_PROP_ID_CTRL_LINK_HEAP_ID	0x0800136F
+#define INTENT_ID_MODULE_INSTANCE_INFO		0x08001089
+#define APM_CTRL_LINK_HEAP_ID_DEFAULT		1
+
+/* apm_module_ctrl_link_cfg_t followed by its two properties, the vendor's 48 B */
+struct apm_ctrl_link_obj {
+	uint32_t peer_1_mod_iid;
+	uint32_t peer_1_mod_ctrl_port_id;
+	uint32_t peer_2_mod_iid;
+	uint32_t peer_2_mod_ctrl_port_id;
+	uint32_t num_props;
+	struct apm_prop_data intent_prop;	/* CTRL_LINK_INTENT_LIST, 8 B */
+	uint32_t num_intents;
+	uint32_t intent_id;
+	struct apm_prop_data heap_prop;		/* CTRL_LINK_HEAP_ID, 4 B */
+	uint32_t heap_id;
+} __packed;
+
+struct apm_ctrl_link_list_params {
+	struct apm_module_param_data param_data;
+	uint32_t num_ctrl_link_cfg;
+	struct apm_ctrl_link_obj link_obj[];
+} __packed;
+
+#define APM_CTRL_LINK_PSIZE(p, n) ALIGN(struct_size(p, link_obj, n), 8)
+
 struct apm_graph_open_params {
 	struct apm_cmd_header *cmd_header;
 	struct apm_sub_graph_params *sg_data;
@@ -125,6 +161,7 @@ struct apm_graph_open_params {
 	struct apm_module_list_params *mod_list_data;
 	struct apm_prop_list_params *mod_prop_data;
 	struct apm_mod_conn_list_params *mod_conn_list_data;
+	struct apm_ctrl_link_list_params *ctrl_link_data;
 } __packed;
 
 struct apm_pcm_module_media_fmt_cmd {
@@ -623,13 +660,190 @@ static void audioreach_fill_voice_cfg(const struct audioreach_graph_info *info,
 	}
 }
 
+/*
+ * The two endpoint-to-mailbox control links the
+ * vendor's HANDSET voice graph carries and this port's does not, with the
+ * vendor's control port ids for the same module classes:
+ *
+ *   TX  CODEC_DMA_SOURCE.ctrl 0x80000009 <-> MAILBOX_TX.ctrl 0x80000005
+ *   RX  MAILBOX_RX.ctrl 0x80000000       <-> I2S_SINK.ctrl 0x80000000
+ *
+ * The instance ids come from the topology objects of the open itself (RX: the
+ * sink rides in the merged open, 0021) or of the routed backend that is
+ * already open (TX: the graph holding this front end's DPCM source module).
+ * Exactly one module of each role, or no link and a warning - never a guess.
+ */
+#define AR_CTRL_PORT_TX_ENDPOINT	0x80000009
+#define AR_CTRL_PORT_TX_MAILBOX		0x80000005
+#define AR_CTRL_PORT_RX_MAILBOX		0x80000000
+#define AR_CTRL_PORT_RX_ENDPOINT	0x80000000
+
+struct audioreach_ctrl_link {
+	const char *name;
+	uint32_t peer_1_iid;
+	uint32_t peer_1_port;
+	uint32_t peer_2_iid;
+	uint32_t peer_2_port;
+};
+
+static int audioreach_count_module(const struct audioreach_graph_info *info,
+				   uint32_t module_id, uint32_t *iid)
+{
+	struct audioreach_container *container;
+	struct audioreach_sub_graph *sgs;
+	struct audioreach_module *module;
+	int n = 0;
+
+	list_for_each_entry(sgs, &info->sg_list, node)
+		list_for_each_entry(container, &sgs->container_list, node)
+			list_for_each_entry(module, &container->modules_list, node)
+				if (module->module_id == module_id) {
+					*iid = module->instance_id;
+					n++;
+				}
+	return n;
+}
+
+static int audioreach_count_module_in_open(const struct audioreach_graph_info *const *infos,
+					   int ninfo, uint32_t module_id, uint32_t *iid)
+{
+	int n = 0, i;
+
+	for (i = 0; i < ninfo; i++)
+		n += audioreach_count_module(infos[i], module_id, iid);
+	return n;
+}
+
+static bool audioreach_info_has_iid(const struct audioreach_graph_info *info, uint32_t iid)
+{
+	struct audioreach_container *container;
+	struct audioreach_sub_graph *sgs;
+	struct audioreach_module *module;
+
+	list_for_each_entry(sgs, &info->sg_list, node)
+		list_for_each_entry(container, &sgs->container_list, node)
+			list_for_each_entry(module, &container->modules_list, node)
+				if (module->instance_id == iid)
+					return true;
+	return false;
+}
+
+/*
+ * The graph that holds module iid, if it is open on the DSP (GRAPH_OPEN
+ * answered with status 0), else NULL; *gid names the graph either way.
+ */
+static struct audioreach_graph_info *audioreach_open_graph_with_module(struct q6apm *apm,
+								      uint32_t iid, int *gid)
+{
+	struct audioreach_graph_info *cand, *found = NULL;
+	struct audioreach_graph *g;
+	int id;
+
+	mutex_lock(&apm->lock);
+	idr_for_each_entry(&apm->graph_info_idr, cand, id) {
+		if (!audioreach_info_has_iid(cand, iid))
+			continue;
+		*gid = id;
+		g = idr_find(&apm->graph_idr, id);
+		if (g && g->open_result.seen && !g->open_result.rc && !g->open_result.status)
+			found = cand;
+		break;
+	}
+	mutex_unlock(&apm->lock);
+
+	return found;
+}
+
+/*
+ * Returns 1 with *link filled when this open gets a control link, 0 when it
+ * is not a voice open, and -ENOENT (after a warning) when it is a voice open
+ * whose endpoint cannot be resolved to exactly one module.
+ */
+static int audioreach_voice_ctrl_link(struct q6apm *apm,
+				      const struct audioreach_graph_info *const *infos,
+				      int ninfo, struct audioreach_ctrl_link *link)
+{
+	uint32_t mb_rx = 0, mb_tx = 0, sink = 0, src = 0;
+	int n_mb_rx, n_mb_tx, n_ep, gid = -1;
+	struct audioreach_graph_info *be;
+
+	n_mb_rx = audioreach_count_module_in_open(infos, ninfo, MODULE_ID_MAILBOX_RX, &mb_rx);
+	n_mb_tx = audioreach_count_module_in_open(infos, ninfo, MODULE_ID_MAILBOX_TX, &mb_tx);
+	if (!n_mb_rx && !n_mb_tx)
+		return 0;
+	if (n_mb_rx + n_mb_tx != 1) {
+		dev_warn(apm->dev, "GRAPH_OPEN graph %d: %d MAILBOX_RX + %d MAILBOX_TX in one open: no control link\n",
+			 infos[0]->id, n_mb_rx, n_mb_tx);
+		return -ENOENT;
+	}
+
+	if (n_mb_rx) {
+		n_ep = audioreach_count_module_in_open(infos, ninfo, MODULE_ID_I2S_SINK, &sink);
+		if (n_ep != 1) {
+			dev_warn(apm->dev, "GRAPH_OPEN graph %d: MAILBOX_RX 0x%x but %d I2S_SINK in this open: no RX control link\n",
+				 infos[0]->id, mb_rx, n_ep);
+			return -ENOENT;
+		}
+		link->name = "RX";
+		link->peer_1_iid = mb_rx;
+		link->peer_1_port = AR_CTRL_PORT_RX_MAILBOX;
+		link->peer_2_iid = sink;
+		link->peer_2_port = AR_CTRL_PORT_RX_ENDPOINT;
+		return 1;
+	}
+
+	/* TX: the endpoint is in the backend this front end is routed from */
+	if (!infos[0]->src_mod_inst_id) {
+		dev_warn(apm->dev, "GRAPH_OPEN graph %d: MAILBOX_TX 0x%x but no DPCM source module: no TX control link\n",
+			 infos[0]->id, mb_tx);
+		return -ENOENT;
+	}
+	be = audioreach_open_graph_with_module(apm, infos[0]->src_mod_inst_id, &gid);
+	if (!be) {
+		dev_warn(apm->dev, "GRAPH_OPEN graph %d: the backend holding source module 0x%x (graph %d) is not open yet: no TX control link\n",
+			 infos[0]->id, infos[0]->src_mod_inst_id, gid);
+		return -ENOENT;
+	}
+	n_ep = audioreach_count_module(be, MODULE_ID_CODEC_DMA_SOURCE, &src);
+	if (n_ep != 1) {
+		dev_warn(apm->dev, "GRAPH_OPEN graph %d: backend graph %d has %d CODEC_DMA_SOURCE: no TX control link\n",
+			 infos[0]->id, gid, n_ep);
+		return -ENOENT;
+	}
+	link->name = "TX";
+	link->peer_1_iid = src;
+	link->peer_1_port = AR_CTRL_PORT_TX_ENDPOINT;
+	link->peer_2_iid = mb_tx;
+	link->peer_2_port = AR_CTRL_PORT_TX_MAILBOX;
+	return 1;
+}
+
+static void audioreach_fill_ctrl_link(struct apm_ctrl_link_obj *obj,
+				      const struct audioreach_ctrl_link *link)
+{
+	obj->peer_1_mod_iid = link->peer_1_iid;
+	obj->peer_1_mod_ctrl_port_id = link->peer_1_port;
+	obj->peer_2_mod_iid = link->peer_2_iid;
+	obj->peer_2_mod_ctrl_port_id = link->peer_2_port;
+	obj->num_props = 2;
+	obj->intent_prop.prop_id = APM_MODULE_PROP_ID_CTRL_LINK_INTENT_LIST;
+	obj->intent_prop.prop_size = sizeof(obj->num_intents) + sizeof(obj->intent_id);
+	obj->num_intents = 1;
+	obj->intent_id = INTENT_ID_MODULE_INSTANCE_INFO;
+	obj->heap_prop.prop_id = APM_MODULE_PROP_ID_CTRL_LINK_HEAP_ID;
+	obj->heap_prop.prop_size = sizeof(obj->heap_id);
+	obj->heap_id = APM_CTRL_LINK_HEAP_ID_DEFAULT;
+}
+
 static void *__audioreach_alloc_graph_pkt(struct q6apm *apm,
 					  const struct audioreach_graph_info *const *infos,
 					  int ninfo)
 {
-	int payload_size, sg_sz, cont_sz, ml_sz, mp_sz, mc_sz;
+	int payload_size, sg_sz, cont_sz, ml_sz, mp_sz, mc_sz, cl_sz = 0;
 	const struct audioreach_graph_info *info = infos[0];
 	struct apm_module_param_data  *param_data;
+	struct apm_ctrl_link_list_params *clp;
+	struct audioreach_ctrl_link link;
 	struct apm_container_params *cont_params;
 	struct audioreach_container *container;
 	struct apm_sub_graph_params *sg_params;
@@ -687,8 +901,10 @@ static void *__audioreach_alloc_graph_pkt(struct q6apm *apm,
 
 	mp_sz = APM_MOD_PROP_PSIZE(mprop, num_modules);
 	mc_sz =	APM_MOD_CONN_PSIZE(mcon, num_connections);
+	if (audioreach_voice_ctrl_link(apm, infos, ninfo, &link) > 0)
+		cl_sz = APM_CTRL_LINK_PSIZE(clp, 1);
 
-	payload_size = sg_sz + cont_sz + ml_sz + mp_sz + mc_sz;
+	payload_size = sg_sz + cont_sz + ml_sz + mp_sz + mc_sz + cl_sz;
 	payload_size += audioreach_voice_cfg_size(info);
 	pkt = audioreach_alloc_apm_cmd_pkt(payload_size, APM_CMD_GRAPH_OPEN, 0);
 	if (IS_ERR(pkt))
@@ -741,6 +957,21 @@ static void *__audioreach_alloc_graph_pkt(struct q6apm *apm,
 	params.mod_conn_list_data->num_connections = num_connections;
 	p += mc_sz;
 
+	/* Module control link */
+	params.ctrl_link_data = NULL;
+	if (cl_sz) {
+		params.ctrl_link_data = p;
+		param_data = &params.ctrl_link_data->param_data;
+		param_data->module_instance_id = APM_MODULE_INSTANCE_ID;
+		param_data->param_id = APM_PARAM_ID_MODULE_CTRL_LINK_CFG;
+		/* the vendor declares the unpadded 52 B; the pad stays zero */
+		param_data->param_size = struct_size(clp, link_obj, 1) -
+					 APM_MODULE_PARAM_DATA_SIZE;
+		params.ctrl_link_data->num_ctrl_link_cfg = 1;
+		audioreach_fill_ctrl_link(&params.ctrl_link_data->link_obj[0], &link);
+		p += cl_sz;
+	}
+
 	audioreach_populate_graph(apm, infos, ninfo, &params);
 
 	{
@@ -752,6 +983,13 @@ static void *__audioreach_alloc_graph_pkt(struct q6apm *apm,
 					payload_size - vc_sz, vc_sz);
 	}
 
+	if (cl_sz)
+		dev_dbg(apm->dev, "GRAPH_OPEN graph %d carries the %s module-control link 0x%x.ctrl0x%x <-> 0x%x.ctrl0x%x intent 0x%x heap %u: param 0x%x, %u B at offset %d\n",
+			 info->id, link.name, link.peer_1_iid, link.peer_1_port,
+			 link.peer_2_iid, link.peer_2_port, INTENT_ID_MODULE_INSTANCE_INFO,
+			 APM_CTRL_LINK_HEAP_ID_DEFAULT, APM_PARAM_ID_MODULE_CTRL_LINK_CFG,
+			 params.ctrl_link_data->param_data.param_size,
+			 (int)((void *)params.ctrl_link_data - ((void *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE)));
 	if (ninfo > 1)
 		dev_dbg(apm->dev, "GRAPH_OPEN graph %d carries graph %d in the same open: %d sub-graphs, %d containers, %d modules, %d connections\n",
 			 info->id, infos[1]->id, num_sub_graphs, num_containers,
