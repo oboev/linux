@@ -310,6 +310,61 @@ static int sia9177_start(struct snd_soc_component *component)
 	return 0;
 }
 
+/*
+ * Mute the amplifier at its output stage and leave the rest of it alone.
+ *
+ * sia9177_stop() clears this bit too, but follows it with standby, which can
+ * only be left by replaying the six-register startup sequence - by then
+ * against a bit clock that is already running. Writing bit 2 on its own keeps
+ * the part's clock lock, its interface configuration and its RUN state across
+ * a route change.
+ */
+static int sia9177_set_output(struct snd_soc_component *component, bool on)
+{
+	struct sia9177_priv *priv = snd_soc_component_get_drvdata(component);
+
+	return regmap_update_bits(priv->regmap, SIA9177_REG_CTRL, BIT(2),
+				  on ? BIT(2) : 0);
+}
+
+static void sia9177_stop(struct snd_soc_component *component)
+{
+	struct sia9177_priv *priv = snd_soc_component_get_drvdata(component);
+	unsigned int val;
+
+	/*
+	 * A part that never reached RUN has latched nothing and has nothing to
+	 * tear down, while the interface it shares may be carrying the other
+	 * part's audio. Both parts are started at unmute, so this is the one
+	 * that failed to start.
+	 */
+	if (!priv->running)
+		return;
+
+	priv->running = false;
+
+	regmap_update_bits(priv->regmap, SIA9177_REG_CTRL, BIT(2), 0);
+	usleep_range(1000, 1500);
+	regmap_update_bits(priv->regmap, SIA9177_REG_CTRL, BIT(0), BIT(0));
+	usleep_range(1000, 1500);
+
+	if (!regmap_read(priv->regmap, SIA9177_REG_STATE, &val) &&
+	    (val & SIA9177_STATE_MASK) != SIA9177_STATE_STANDBY)
+		dev_warn(component->dev, "failed to stop: state %#x\n", val);
+
+	/*
+	 * Last chance to see what the stream latched: .shutdown asserts reset
+	 * straight after this, which clears the register. Nothing mainline
+	 * consumes the IV sense the vendor's excursion protection runs on, so
+	 * the sticky over-temperature/over-current/under-voltage bits are the
+	 * only telemetry there is that playback was overdriving the parts.
+	 */
+	if (!regmap_read(priv->regmap, SIA9177_REG_INT_STAT, &val) && val) {
+		sia9177_report_faults(component, "during playback", val);
+		regmap_write(priv->regmap, SIA9177_REG_INT_CLEAR, 0xffff);
+	}
+}
+
 static int sia9177_power_up(struct snd_soc_component *component)
 {
 	struct sia9177_priv *priv = snd_soc_component_get_drvdata(component);
@@ -342,58 +397,32 @@ static int sia9177_power_up(struct snd_soc_component *component)
 	priv->powered = true;
 
 	/*
-	 * An amplifier switched off is left in the standby the init writes put
-	 * it in. It keeps its bit-clock vote: the interface is shared, and the
-	 * part that is playing needs the clock either way.
+	 * Both parts are started, whether or not this one is meant to be
+	 * heard. The chip latches its clock configuration on the way to RUN,
+	 * and a part that sits the bring-up out can only join afterwards by
+	 * replaying the startup sequence against a bit clock that is already
+	 * running - which costs it the lock it just acquired. One that is not
+	 * wanted is muted at its output instead, which is a single bit.
 	 */
-	if (!priv->enabled)
-		return 0;
-
 	ret = sia9177_start(component);
-	if (ret) {
-		priv->powered = false;
-		sia9177_bclk_disable(priv);
+	if (ret)
+		goto err_power;
+
+	if (!priv->enabled) {
+		ret = sia9177_set_output(component, false);
+		if (ret)
+			goto err_stop;
 	}
+
+	return 0;
+
+err_stop:
+	sia9177_stop(component);
+err_power:
+	priv->powered = false;
+	sia9177_bclk_disable(priv);
 
 	return ret;
-}
-
-static void sia9177_stop(struct snd_soc_component *component)
-{
-	struct sia9177_priv *priv = snd_soc_component_get_drvdata(component);
-	unsigned int val;
-
-	/*
-	 * A part that never reached RUN - one switched out of the stream, or
-	 * one that failed to start - has latched nothing and has nothing to
-	 * tear down, while the interface it shares may be carrying the other
-	 * part's audio.
-	 */
-	if (!priv->running)
-		return;
-
-	priv->running = false;
-
-	regmap_update_bits(priv->regmap, SIA9177_REG_CTRL, BIT(2), 0);
-	usleep_range(1000, 1500);
-	regmap_update_bits(priv->regmap, SIA9177_REG_CTRL, BIT(0), BIT(0));
-	usleep_range(1000, 1500);
-
-	if (!regmap_read(priv->regmap, SIA9177_REG_STATE, &val) &&
-	    (val & SIA9177_STATE_MASK) != SIA9177_STATE_STANDBY)
-		dev_warn(component->dev, "failed to stop: state %#x\n", val);
-
-	/*
-	 * Last chance to see what the stream latched: .shutdown asserts reset
-	 * straight after this, which clears the register. Nothing mainline
-	 * consumes the IV sense the vendor's excursion protection runs on, so
-	 * the sticky over-temperature/over-current/under-voltage bits are the
-	 * only telemetry there is that playback was overdriving the parts.
-	 */
-	if (!regmap_read(priv->regmap, SIA9177_REG_INT_STAT, &val) && val) {
-		sia9177_report_faults(component, "during playback", val);
-		regmap_write(priv->regmap, SIA9177_REG_INT_CLEAR, 0xffff);
-	}
 }
 
 static void sia9177_power_down(struct snd_soc_component *component)
@@ -470,11 +499,14 @@ static int sia9177_switch_get(struct snd_kcontrol *kcontrol,
 }
 
 /*
- * Whether this amplifier takes part in the stream at all. Both do for
- * ordinary playback; the earpiece is the one case that wants a single part,
- * and the vendor builds it the same way - its handset path enables channel 0
- * alone and leaves channel 1 at the muted default, so the top transducer is
- * the only one sounding.
+ * Whether this amplifier is heard. Both are for ordinary playback; the
+ * earpiece is the one case that wants a single part, and the vendor builds it
+ * the same way - its handset path enables channel 0 alone and leaves channel 1
+ * at the muted default, so the top transducer is the only one sounding.
+ *
+ * A live change is one register bit. The part is running either way, because
+ * the stream started it either way, so it neither joins nor leaves the
+ * interface here and nothing is replayed under the bit clock.
  */
 static int sia9177_switch_put(struct snd_kcontrol *kcontrol,
 			      struct snd_ctl_elem_value *ucontrol)
@@ -487,19 +519,8 @@ static int sia9177_switch_put(struct snd_kcontrol *kcontrol,
 	mutex_lock(&priv->lock);
 
 	if (enable != priv->enabled) {
-		/*
-		 * Both directions are the sequences the stream itself runs
-		 * against live clocks: off mid-stream is the shutdown one
-		 * without the clock teardown, on is the startup one. The init
-		 * writes are not repeated - the part sat out in the standby
-		 * they left it in, and its scene cannot have moved since.
-		 */
-		if (priv->powered) {
-			if (enable)
-				ret = sia9177_start(component);
-			else
-				sia9177_stop(component);
-		}
+		if (priv->powered)
+			ret = sia9177_set_output(component, enable);
 		if (!ret) {
 			priv->enabled = enable;
 			ret = 1;
