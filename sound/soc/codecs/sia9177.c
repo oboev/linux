@@ -92,6 +92,13 @@ struct sia9177_priv {
 	/* serialises a scene or switch change against the stream's own transitions */
 	struct mutex lock;
 	unsigned int scene;
+	/*
+	 * The scene whose init table is actually programmed in the chip, or
+	 * SIA9177_SCENE_COUNT while it is in reset and holds none. The startup
+	 * sequence assumes its own scene's init writes preceded it, so a start
+	 * is refused rather than repaired when the two have come apart.
+	 */
+	unsigned int init_scene;
 	bool enabled;
 	bool powered;
 	bool running;
@@ -227,6 +234,8 @@ static int sia9177_configure(struct snd_soc_component *component)
 	if (ret)
 		goto err_reset;
 
+	priv->init_scene = priv->scene;
+
 	ret = regmap_read(priv->regmap, SIA9177_REG_STATE, &val);
 	if (ret)
 		goto err_reset;
@@ -245,6 +254,7 @@ static int sia9177_configure(struct snd_soc_component *component)
 	 */
 err_reset:
 	gpiod_set_value_cansleep(priv->reset_gpio, 1);
+	priv->init_scene = SIA9177_SCENE_COUNT;
 	return ret;
 }
 
@@ -253,6 +263,17 @@ static int sia9177_start(struct snd_soc_component *component)
 	struct sia9177_priv *priv = snd_soc_component_get_drvdata(component);
 	unsigned int val;
 	int ret;
+
+	/*
+	 * Never write a startup sequence over another scene's init writes: the
+	 * two halves are one tuning, and the missing half cannot be supplied
+	 * from here without putting init writes on a running interface.
+	 */
+	if (priv->init_scene != priv->scene) {
+		dev_err(component->dev, "scene %u is not the programmed one (%u)\n",
+			priv->scene, priv->init_scene);
+		return -EINVAL;
+	}
 
 	ret = regmap_multi_reg_write(priv->regmap, priv->tuning[priv->scene].start,
 				     priv->tuning[priv->scene].start_len);
@@ -280,6 +301,8 @@ static int sia9177_start(struct snd_soc_component *component)
 		if (!regmap_read(priv->regmap, SIA9177_REG_INT_STAT, &stat) &&
 		    stat)
 			sia9177_report_faults(component, "at start", stat);
+
+		return ret;
 	}
 
 	priv->running = true;
@@ -340,6 +363,15 @@ static void sia9177_stop(struct snd_soc_component *component)
 	struct sia9177_priv *priv = snd_soc_component_get_drvdata(component);
 	unsigned int val;
 
+	/*
+	 * A part that never reached RUN - one switched out of the stream, or
+	 * one that failed to start - has latched nothing and has nothing to
+	 * tear down, while the interface it shares may be carrying the other
+	 * part's audio.
+	 */
+	if (!priv->running)
+		return;
+
 	priv->running = false;
 
 	regmap_update_bits(priv->regmap, SIA9177_REG_CTRL, BIT(2), 0);
@@ -373,40 +405,6 @@ static void sia9177_power_down(struct snd_soc_component *component)
 	sia9177_bclk_disable(priv);
 }
 
-/*
- * Re-apply the tuning when the scene changes under a running stream. The bit
- * clock is deliberately left running: the DSP is still feeding the interface,
- * the other amplifier is still voting for the clock, and the chip latched its
- * clock configuration when BCLK first appeared - taking it away here would
- * make the return a second first-appearance on a chip that is not in reset.
- *
- * That does put the init writes on a live bus, which is the ordering
- * sia9177_configure() exists to avoid. It is not the same case - the chip is
- * past the latch and only its tuning is being replaced - but it is not the
- * vendor's case either: the vendor driver has this path and compiles it out
- * on this platform, where scenes change by tearing the device down instead.
- * A chip that does not come back says so, with the state it stuck at.
- */
-static int sia9177_apply(struct snd_soc_component *component)
-{
-	struct sia9177_priv *priv = snd_soc_component_get_drvdata(component);
-	int ret;
-
-	ret = regmap_multi_reg_write(priv->regmap, priv->tuning[priv->scene].init,
-				     priv->tuning[priv->scene].init_len);
-	if (ret)
-		return ret;
-
-	return sia9177_start(component);
-}
-
-static int sia9177_rescene(struct snd_soc_component *component)
-{
-	sia9177_stop(component);
-
-	return sia9177_apply(component);
-}
-
 static const char * const sia9177_scene_text[] = { "Speaker", "Receiver" };
 
 static SOC_ENUM_SINGLE_EXT_DECL(sia9177_scene_enum, sia9177_scene_text);
@@ -422,6 +420,17 @@ static int sia9177_scene_get(struct snd_kcontrol *kcontrol,
 	return 0;
 }
 
+/*
+ * The scene is chosen for the next stream, not for this one: it takes effect
+ * through the init writes sia9177_configure() makes while the interface is
+ * still quiet, so a change is refused for as long as the stream is powered.
+ *
+ * Writing another scene's init table into a running part costs it its lock -
+ * it reaches RUN, then falls back into the ramp for seconds at a time, with
+ * no fault latched and the bit clock never interrupted. Measured on a live
+ * call, on both parts, in each direction it was tried. The vendor driver has
+ * this path too, and compiles it out on this platform.
+ */
 static int sia9177_scene_put(struct snd_kcontrol *kcontrol,
 			     struct snd_ctl_elem_value *ucontrol)
 {
@@ -436,10 +445,12 @@ static int sia9177_scene_put(struct snd_kcontrol *kcontrol,
 	mutex_lock(&priv->lock);
 
 	if (scene != priv->scene) {
-		priv->scene = scene;
-		ret = priv->running ? sia9177_rescene(component) : 0;
-		if (!ret)
+		if (priv->powered) {
+			ret = -EBUSY;
+		} else {
+			priv->scene = scene;
 			ret = 1;
+		}
 	}
 
 	mutex_unlock(&priv->lock);
@@ -476,20 +487,23 @@ static int sia9177_switch_put(struct snd_kcontrol *kcontrol,
 	mutex_lock(&priv->lock);
 
 	if (enable != priv->enabled) {
-		priv->enabled = enable;
 		/*
-		 * Off mid-stream is the shutdown sequence without the clock
-		 * teardown; on is the whole tuning again, because the scene
-		 * may have moved while this part sat out.
+		 * Both directions are the sequences the stream itself runs
+		 * against live clocks: off mid-stream is the shutdown one
+		 * without the clock teardown, on is the startup one. The init
+		 * writes are not repeated - the part sat out in the standby
+		 * they left it in, and its scene cannot have moved since.
 		 */
 		if (priv->powered) {
 			if (enable)
-				ret = sia9177_apply(component);
+				ret = sia9177_start(component);
 			else
 				sia9177_stop(component);
 		}
-		if (!ret)
+		if (!ret) {
+			priv->enabled = enable;
 			ret = 1;
+		}
 	}
 
 	mutex_unlock(&priv->lock);
@@ -547,6 +561,7 @@ static void sia9177_shutdown(struct snd_pcm_substream *substream,
 	mutex_lock(&priv->lock);
 	priv->running = false;
 	gpiod_set_value_cansleep(priv->reset_gpio, 1);
+	priv->init_scene = SIA9177_SCENE_COUNT;
 	mutex_unlock(&priv->lock);
 }
 
@@ -685,6 +700,7 @@ static int sia9177_i2c_probe(struct i2c_client *i2c)
 	device_property_read_u32(dev, "si,channel-num", &channel);
 	priv->tuning = channel ? sia9177_tuning_right : sia9177_tuning_left;
 	priv->scene = SIA9177_SCENE_SPEAKER;
+	priv->init_scene = SIA9177_SCENE_COUNT;
 	priv->enabled = true;
 
 	i2c_set_clientdata(i2c, priv);
