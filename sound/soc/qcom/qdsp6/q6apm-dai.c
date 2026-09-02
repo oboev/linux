@@ -291,6 +291,12 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
 			return ret;
 		}
 
+		ret = q6apm_graph_slot_prepare(prtd->graph, substream->stream, &cfg);
+		if (ret) {
+			dev_err(dev, "Failed to set the right slot %d\n", ret);
+			return ret;
+		}
+
 		ret = q6apm_graph_prepare(prtd->graph);
 		if (ret) {
 			dev_err(dev, "Failed to prepare Graph %d\n", ret);
@@ -354,6 +360,12 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
 	ret = q6apm_graph_media_format_shmem(prtd->graph, &cfg);
 	if (ret < 0) {
 		dev_err(dev, "Failed to set media format %d\n", ret);
+		return ret;
+	}
+
+	ret = q6apm_graph_slot_prepare(prtd->graph, substream->stream, &cfg);
+	if (ret) {
+		dev_err(dev, "Failed to set the right slot %d\n", ret);
 		return ret;
 	}
 
@@ -545,6 +557,8 @@ static int q6apm_dai_close(struct snd_soc_component *component,
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct q6apm_dai_rtd *prtd = runtime->private_data;
+
+	q6apm_graph_slot_close(prtd->graph, substream->stream);
 
 	if (prtd->state) {
 		/* only stop graph that is started */

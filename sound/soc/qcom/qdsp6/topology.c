@@ -1090,7 +1090,18 @@ static int audioreach_route_unload(struct snd_soc_component *scomp,
 
 static int audioreach_tplg_complete(struct snd_soc_component *component)
 {
-	/* TBD */
+	struct snd_soc_pcm_runtime *rtd;
+	int ret;
+
+	/* one right-slot gate per playback front end */
+	for_each_card_rtds(component->card, rtd) {
+		if (!rtd->dai_link->dynamic || rtd->dai_link->capture_only)
+			continue;
+		ret = q6apm_slot_add(component, rtd->dai_link->id, rtd->dai_link->name);
+		if (ret)
+			return ret;
+	}
+
 	return 0;
 }
 

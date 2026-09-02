@@ -725,6 +725,28 @@ struct param_id_mfc_media_format {
 	uint16_t channel_mapping[];
 } __packed;
 
+/*
+ * A media format converter takes its channel-mixer weights as a list of
+ * tables, each for one input map to one output map: the two channel counts,
+ * the output map, the input map and the Q14 weights in [output][input]
+ * order, every table padded to a 32-bit boundary. The table whose maps match
+ * the running formats is the one applied; the rest are inert, and none
+ * matching leaves the built-in weights in force.
+ */
+#define PARAM_ID_CHMIXER_COEFF			0x0800101F
+#define CHMIXER_COEFF_UNITY_Q14			0x4000
+
+struct param_id_chmixer_coeff {
+	uint32_t num_coeff_tbls;
+} __packed;
+
+struct chmixer_coeff_tbl {
+	uint16_t num_output_channels;
+	uint16_t num_input_channels;
+	/* out_chmap[num_output_channels], in_chmap[num_input_channels], coeff[out][in] */
+	uint16_t data[];
+} __packed;
+
 struct param_id_gapless_early_eos_delay_t {
 	uint32_t early_eos_delay_ms;
 } __packed;
@@ -974,6 +996,8 @@ int audioreach_send_voice_config(struct q6apm_graph *graph, int dir,
 				 uint32_t lb_delay_ms);
 int audioreach_voice_media_format(struct q6apm_graph *graph,
 				  struct audioreach_module_config *cfg);
+int audioreach_set_right_slot(struct q6apm *apm, struct audioreach_graph_info *info,
+			      bool right);
 void *audioreach_alloc_apm_cmd_pkt(int pkt_size, uint32_t opcode, uint32_t
 				    token);
 void audioreach_set_default_channel_mapping(u8 *ch_map, int num_channels);

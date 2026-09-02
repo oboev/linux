@@ -13,7 +13,9 @@
 #include <linux/soc/qcom/apr.h>
 #include <linux/wait.h>
 #include <sound/soc.h>
+#include <sound/soc-card.h>
 #include <sound/soc-dapm.h>
+#include <sound/control.h>
 #include <sound/pcm.h>
 #include "audioreach.h"
 #include "q6apm.h"
@@ -1083,6 +1085,213 @@ static const struct snd_kcontrol_new q6apm_controls[] = {
 		     q6apm_voice_vsid_get, q6apm_voice_vsid_put),
 };
 
+/* Right-slot gates, one per playback front end (struct q6apm_slot). */
+static struct q6apm_slot *q6apm_slot_find(struct q6apm *apm, int graph_id)
+{
+	struct q6apm_slot *slot;
+
+	list_for_each_entry(slot, &apm->slot_list, node)
+		if (slot->graph_id == graph_id)
+			return slot;
+
+	return NULL;
+}
+
+static void q6apm_slot_notify(struct q6apm_slot *slot)
+{
+	if (slot->kctl)
+		snd_ctl_notify(slot->card, SNDRV_CTL_EVENT_MASK_VALUE, &slot->kctl->id);
+}
+
+static int q6apm_slot_get(struct snd_kcontrol *kcontrol,
+			  struct snd_ctl_elem_value *ucontrol)
+{
+	struct q6apm_slot *slot = (struct q6apm_slot *)kcontrol->private_value;
+
+	ucontrol->value.integer.value[0] = slot->on;
+
+	return 0;
+}
+
+/*
+ * The gate moves only while its stream is open. A voice RX stream must also
+ * be running, and is written on the spot: a value set before a call can
+ * then never ride into its first buffer, and the control never reports a
+ * route the wire does not carry. Any other stream may be set between open
+ * and prepare, where the value waits for prepare to write it. The DSP's
+ * answer is the return value - a refused table leaves the control where it
+ * was.
+ */
+static int q6apm_slot_put(struct snd_kcontrol *kcontrol,
+			  struct snd_ctl_elem_value *ucontrol)
+{
+	struct q6apm_slot *slot = (struct q6apm_slot *)kcontrol->private_value;
+	struct q6apm *apm = slot->apm;
+	struct audioreach_graph *graph;
+	bool on = !!ucontrol->value.integer.value[0];
+	int ret = 0;
+
+	mutex_lock(&apm->slot_lock);
+	if (on == slot->on)
+		goto out;
+
+	mutex_lock(&apm->lock);
+	graph = idr_find(&apm->graph_idr, slot->graph_id);
+	if (graph && !kref_get_unless_zero(&graph->refcount))
+		graph = NULL;
+	mutex_unlock(&apm->lock);
+
+	if (!graph) {
+		ret = -EBUSY;
+		goto out;
+	}
+
+	if (graph->start_count && slot->gated)
+		ret = audioreach_set_right_slot(apm, graph->info, on);
+	else if (graph->start_count || slot->voice)
+		ret = -EBUSY;
+
+	kref_put(&graph->refcount, q6apm_put_audioreach_graph);
+
+	if (!ret) {
+		slot->on = on;
+		ret = 1;
+	}
+out:
+	mutex_unlock(&apm->slot_lock);
+
+	return ret;
+}
+
+int q6apm_slot_add(struct snd_soc_component *component, int graph_id,
+		   const char *link_name)
+{
+	struct q6apm *apm = dev_get_drvdata(component->dev);
+	struct snd_kcontrol_new kc = {
+		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+		.info = snd_soc_info_bool_ext,
+		.get = q6apm_slot_get,
+		.put = q6apm_slot_put,
+	};
+	struct audioreach_graph_info *info;
+	struct q6apm_slot *slot;
+	char *name;
+	int ret;
+
+	mutex_lock(&apm->lock);
+	info = idr_find(&apm->graph_info_idr, graph_id);
+	mutex_unlock(&apm->lock);
+	if (!info)
+		return 0;
+
+	slot = devm_kzalloc(apm->dev, sizeof(*slot), GFP_KERNEL);
+	if (!slot)
+		return -ENOMEM;
+
+	name = kasprintf(GFP_KERNEL, "%s Right Slot Switch", link_name);
+	if (!name)
+		return -ENOMEM;
+
+	slot->apm = apm;
+	slot->card = component->card->snd_card;
+	slot->graph_id = graph_id;
+	slot->voice = q6apm_info_is_voice(info, SNDRV_PCM_STREAM_PLAYBACK);
+	slot->dflt = !slot->voice;
+	slot->on = slot->dflt;
+
+	kc.name = name;
+	kc.private_value = (unsigned long)slot;
+	ret = snd_soc_add_component_controls(component, &kc, 1);
+	if (!ret) {
+		slot->kctl = snd_soc_card_get_kcontrol(component->card, name);
+		mutex_lock(&apm->slot_lock);
+		list_add_tail(&slot->node, &apm->slot_list);
+		mutex_unlock(&apm->slot_lock);
+	}
+	kfree(name);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(q6apm_slot_add);
+
+/*
+ * Before the graph is prepared: the converter is written with the gate, so
+ * the first buffer already carries it. A voice RX stream goes to its
+ * default - closed - on every prepare; any other stream keeps what was set
+ * on it since it opened. A stream without a stereo FL/FR output has no
+ * right slot to gate; a voice RX stream shaped that way is refused rather
+ * than started open.
+ */
+int q6apm_graph_slot_prepare(struct q6apm_graph *graph, int dir,
+			     const struct audioreach_module_config *cfg)
+{
+	struct q6apm *apm = graph->apm;
+	struct q6apm_slot *slot;
+	bool changed = false;
+	int ret = 0;
+
+	if (dir != SNDRV_PCM_STREAM_PLAYBACK)
+		return 0;
+
+	mutex_lock(&apm->slot_lock);
+	slot = q6apm_slot_find(apm, graph->id);
+	if (!slot)
+		goto out;
+
+	if (slot->voice) {
+		changed = slot->on != slot->dflt;
+		slot->on = slot->dflt;
+	}
+	slot->gated = cfg->num_channels == 2 &&
+		      cfg->channel_map[0] == PCM_CHANNEL_FL &&
+		      cfg->channel_map[1] == PCM_CHANNEL_FR;
+
+	if (slot->gated)
+		ret = audioreach_set_right_slot(apm, graph->info, slot->on);
+	if (ret == -ENOENT && !slot->voice) {
+		/* no converter in this graph: nothing to gate */
+		slot->gated = false;
+		ret = 0;
+	} else if (!slot->gated && slot->voice) {
+		ret = -EINVAL;
+	}
+out:
+	mutex_unlock(&apm->slot_lock);
+	if (changed)
+		q6apm_slot_notify(slot);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(q6apm_graph_slot_prepare);
+
+/*
+ * The stream is closing: a gate whose default is closed is shut on the wire
+ * first, then the control returns to its default for the next stream.
+ */
+void q6apm_graph_slot_close(struct q6apm_graph *graph, int dir)
+{
+	struct q6apm *apm = graph->apm;
+	struct q6apm_slot *slot;
+	bool changed = false;
+
+	if (dir != SNDRV_PCM_STREAM_PLAYBACK)
+		return;
+
+	mutex_lock(&apm->slot_lock);
+	slot = q6apm_slot_find(apm, graph->id);
+	if (slot) {
+		changed = slot->on != slot->dflt;
+		if (changed && slot->gated && !slot->dflt)
+			audioreach_set_right_slot(apm, graph->info, slot->dflt);
+		slot->on = slot->dflt;
+		slot->gated = false;
+	}
+	mutex_unlock(&apm->slot_lock);
+	if (changed)
+		q6apm_slot_notify(slot);
+}
+EXPORT_SYMBOL_GPL(q6apm_graph_slot_close);
+
 static const struct snd_soc_component_driver q6apm_audio_component = {
 	.name		= APM_AUDIO_DRV_NAME,
 	.probe		= q6apm_audio_probe,
@@ -1106,6 +1315,8 @@ static int apm_probe(gpr_device_t *gdev)
 
 	mutex_init(&apm->lock);
 	mutex_init(&apm->voice_lock);
+	mutex_init(&apm->slot_lock);
+	INIT_LIST_HEAD(&apm->slot_list);
 	apm->dev = dev;
 	apm->gdev = gdev;
 	init_waitqueue_head(&apm->wait);

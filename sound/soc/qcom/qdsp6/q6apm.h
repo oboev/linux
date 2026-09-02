@@ -79,6 +79,10 @@ struct q6apm {
 	struct idr sub_graphs_idr;
 	struct idr containers_idr;
 	struct idr modules_idr;
+
+	/* one right-slot gate per playback front end, q6apm_graph_slot_prepare() */
+	struct mutex slot_lock;
+	struct list_head slot_list;
 };
 
 struct audio_buffer {
@@ -201,4 +205,30 @@ int q6apm_push_pull_config(struct q6apm_graph *graph, phys_addr_t bphys,
 			   phys_addr_t pphys, uint32_t size);
 
 int q6apm_register_watermark_event(struct q6apm_graph *graph, int watermark_bytes, int num_levels);
+
+/*
+ * A playback front end's right-slot gate, "<link> Right Slot Switch". The
+ * value lives here; the stream's media format converter is written to match
+ * it at prepare and on a live change, and the gate returns to its default
+ * whenever the stream closes. A voice RX front end defaults to closed - the
+ * earpiece - and is put back there on every prepare, so a call starts and
+ * ends with the right slot at digital zero whatever userspace did last; its
+ * switch only moves while the stream runs.
+ */
+struct q6apm_slot {
+	struct list_head node;
+	struct q6apm *apm;
+	struct snd_card *card;
+	struct snd_kcontrol *kctl;
+	int graph_id;
+	bool voice;
+	bool dflt;
+	bool on;
+	bool gated;
+};
+
+int q6apm_slot_add(struct snd_soc_component *component, int graph_id, const char *link_name);
+int q6apm_graph_slot_prepare(struct q6apm_graph *graph, int dir,
+			     const struct audioreach_module_config *cfg);
+void q6apm_graph_slot_close(struct q6apm_graph *graph, int dir);
 #endif /* __APM_GRAPH_ */

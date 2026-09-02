@@ -1389,6 +1389,102 @@ static int audioreach_mfc_set_media_format(struct q6apm_graph *graph,
 	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
 }
 
+/*
+ * The right slot of a stereo stream, gated on the stream's own media format
+ * converter. Two tables cover the inputs this driver puts in front of a
+ * stereo FL/FR output: the vocoder decoder's mono, which is a single centre
+ * channel (the vendor's own calibration for the voice RX converter names it
+ * so), and a stereo PCM carried through the converter unchanged. In both
+ * the left row is unity; the right row is unity or zero. The converter
+ * re-derives only its mixing matrix from a new table, so the change lands
+ * on the running stream without a stop.
+ */
+#define AR_CHMIXER_TBL_SIZE(nout, nin) \
+	ALIGN(sizeof(struct chmixer_coeff_tbl) + \
+	      ((nout) + (nin) + (nout) * (nin)) * sizeof(uint16_t), 4)
+
+static int audioreach_mfc_set_right_slot(struct q6apm *apm,
+					 const struct audioreach_module *module,
+					 bool right)
+{
+	struct apm_module_param_data *param_data;
+	struct param_id_chmixer_coeff *coeff;
+	struct chmixer_coeff_tbl *tbl;
+	uint16_t r = right ? CHMIXER_COEFF_UNITY_Q14 : 0;
+	int psize = sizeof(*coeff) + AR_CHMIXER_TBL_SIZE(2, 1) +
+		    AR_CHMIXER_TBL_SIZE(2, 2);
+	void *p;
+
+	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(psize + APM_MODULE_PARAM_DATA_SIZE,
+									 APM_CMD_SET_CFG, 0);
+	if (IS_ERR(pkt))
+		return PTR_ERR(pkt);
+
+	p = (void *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
+
+	param_data = p;
+	param_data->module_instance_id = module->instance_id;
+	param_data->error_code = 0;
+	param_data->param_id = PARAM_ID_CHMIXER_COEFF;
+	param_data->param_size = psize;
+	p = p + APM_MODULE_PARAM_DATA_SIZE;
+
+	coeff = p;
+	coeff->num_coeff_tbls = 2;
+	p = p + sizeof(*coeff);
+
+	/* mono centre in, FL/FR out */
+	tbl = p;
+	tbl->num_output_channels = 2;
+	tbl->num_input_channels = 1;
+	tbl->data[0] = PCM_CHANNEL_FL;
+	tbl->data[1] = PCM_CHANNEL_FR;
+	tbl->data[2] = PCM_CHANNEL_FC;
+	tbl->data[3] = CHMIXER_COEFF_UNITY_Q14;	/* FL <- C */
+	tbl->data[4] = r;			/* FR <- C */
+	p = p + AR_CHMIXER_TBL_SIZE(2, 1);
+
+	/* FL/FR in, FL/FR out */
+	tbl = p;
+	tbl->num_output_channels = 2;
+	tbl->num_input_channels = 2;
+	tbl->data[0] = PCM_CHANNEL_FL;
+	tbl->data[1] = PCM_CHANNEL_FR;
+	tbl->data[2] = PCM_CHANNEL_FL;
+	tbl->data[3] = PCM_CHANNEL_FR;
+	tbl->data[4] = CHMIXER_COEFF_UNITY_Q14;	/* FL <- FL */
+	tbl->data[5] = 0;			/* FL <- FR */
+	tbl->data[6] = 0;			/* FR <- FL */
+	tbl->data[7] = r;			/* FR <- FR */
+
+	return q6apm_send_cmd_sync(apm, pkt, 0);
+}
+
+int audioreach_set_right_slot(struct q6apm *apm, struct audioreach_graph_info *info,
+			      bool right)
+{
+	struct audioreach_container *container;
+	struct audioreach_sub_graph *sgs;
+	struct audioreach_module *module;
+	int ret, n = 0;
+
+	list_for_each_entry(sgs, &info->sg_list, node) {
+		list_for_each_entry(container, &sgs->container_list, node) {
+			list_for_each_entry(module, &container->modules_list, node) {
+				if (module->module_id != MODULE_ID_MFC)
+					continue;
+				ret = audioreach_mfc_set_right_slot(apm, module, right);
+				if (ret)
+					return ret;
+				n++;
+			}
+		}
+	}
+
+	return n ? 0 : -ENOENT;
+}
+EXPORT_SYMBOL_GPL(audioreach_set_right_slot);
+
 static int audioreach_set_compr_media_format(struct media_format *media_fmt_hdr,
 					     void *p,
 					     const struct audioreach_module_config *mcfg)
