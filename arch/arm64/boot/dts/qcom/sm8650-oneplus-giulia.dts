@@ -129,7 +129,7 @@
 		/*
 		 * This string and `CONFIG_CMDLINE` must stay byte-identical.
 		 */
-		bootargs = "console=tty0 console=ttyGS0 clk_ignore_unused pd_ignore_unused regulator_ignore_unused initcall_blacklist=simpledrm_platform_driver_init loglevel=5 panic=0";
+		bootargs = "console=tty0 console=ttyGS0 clk_ignore_unused pd_ignore_unused regulator_ignore_unused initcall_blacklist=simpledrm_platform_driver_init loglevel=5 panic=0 plymouth.enable=0";
 
 		/*
 		 * Framebuffer inherited from the bootloader splash. Gives
