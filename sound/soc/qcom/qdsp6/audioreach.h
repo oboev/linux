@@ -55,6 +55,14 @@ struct q6apm_graph;
  * against instance 0x4; the modem talks to it directly after that.
  */
 #define VCPM_PARAM_ID_VOICE_CONFIG		0x08001162
+/*
+ * Per-subgraph persistent calibration. The vendor never sends the records it
+ * carries on their own: it registers this table for one subgraph with
+ * APM_CMD_REGISTER_CFG, out of band, after that graph's GRAPH_OPEN and before
+ * its prepare (audioreach-graphservices gsl_graph_send_persist_cal()).
+ */
+#define VCPM_PARAM_ID_CAL_TABLE			0x08001163
+#define VCPM_PARAM_ID_CLK_CTRL			0x080011AE
 #define VCPM_PROPERTY_ID_TAG_INFO		0x080011B2
 #define VCPM_PARAM_ID_VSID			0x080011BC
 #define VCPM_PARAM_ID_TX_DEV_PP_CHANNEL_INFO	0x08001310
@@ -89,11 +97,20 @@ struct q6apm_graph;
 #define APM_CMD_SHARED_MEM_MAP_REGIONS		0x0100100C
 #define APM_CMD_SHARED_MEM_UNMAP_REGIONS	0x0100100D
 #define APM_CMD_REGISTER_MODULE_EVENTS		0x0100100E
+#define APM_CMD_REGISTER_CFG			0x01001008
+#define APM_CMD_DEREGISTER_CFG			0x01001009
 #define APM_EVENT_MODULE_TO_CLIENT              0x03001000
 #define APM_CMD_RSP_SHARED_MEM_MAP_REGIONS	0x02001001
 #define APM_MMAP_TOKEN_GID_MASK			GENMASK(15, 0)
 #define APM_MMAP_TOKEN_MAP_TYPE_POS_BUF		BIT(16)
 #define APM_MMAP_TOKEN_MAP_TYPE_SHIFT		16
+/*
+ * Persistent-calibration mappings are neither the graph's data buffer nor its
+ * position buffer, and there may be two of them live at once, so they carry
+ * their own map type and a slot index rather than reusing either handle.
+ */
+#define APM_MMAP_TOKEN_MAP_TYPE_CAL		BIT(17)
+#define APM_MMAP_TOKEN_CAL_SLOT			BIT(18)
 #define APM_CMD_RSP_GET_CFG			0x02001000
 #define APM_CMD_CLOSE_ALL			0x01001013
 #define APM_CMD_REGISTER_SHARED_CFG		0x0100100A

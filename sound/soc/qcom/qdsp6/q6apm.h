@@ -50,6 +50,51 @@
 #define APM_LAST_BUFFER_FLAG			BIT(30)
 #define NO_TIMESTAMP				0xFF00
 
+#define Q6APM_VCAL_MAX_TABLES	2
+
+/*
+ * One VCPM persistent-calibration table: its firmware, its own coherent
+ * buffer and mapping handle, and the wire evidence for the register and
+ * deregister commands. Ownership is explicit so every failure path knows
+ * exactly what it must undo.
+ */
+struct q6apm_vcal_table {
+	const struct q6apm_vcal_fw *fw;
+	void *virt;
+	dma_addr_t phys;
+	size_t size;			/* the wrapped table */
+	uint32_t payload_size;		/* the plain table, what is registered */
+	uint32_t sg_id;
+	long long sid;			/* SMMU stream id, or -1 */
+	uint32_t mem_map_handle;
+	uint8_t sha256[32];
+
+	bool allocated;
+	bool mapped;
+	bool registered;
+	bool deregistered;
+
+	unsigned int seq;
+	int build_rc;
+	int map_rc;
+	int send_rc;
+	int wrapper_rc;
+	bool send_called;
+	bool wait_completed;
+	bool response_seen;
+	uint32_t acknowledged_opcode;
+	bool raw_dsp_status_valid;
+	uint32_t raw_dsp_status;
+};
+
+struct q6apm_vcal {
+	struct mutex lock;
+	bool in_flight;
+	unsigned int ntables;
+	struct q6apm_graph *graph;
+	struct q6apm_vcal_table tbl[Q6APM_VCAL_MAX_TABLES];
+};
+
 struct q6apm {
 	struct device *dev;
 	gpr_port_t *port;
@@ -72,6 +117,9 @@ struct q6apm {
 	unsigned int voice_open_count;
 	uint32_t voice_vsid_idx;
 	uint32_t voice_vsid;
+
+	/* VCPM per-subgraph persistent calibration (q6apm-vcpm-cal.c) */
+	struct q6apm_vcal vcal;
 
 	struct list_head widget_list;
 	struct idr graph_idr;
@@ -231,4 +279,10 @@ int q6apm_slot_add(struct snd_soc_component *component, int graph_id, const char
 int q6apm_graph_slot_prepare(struct q6apm_graph *graph, int dir,
 			     const struct audioreach_module_config *cfg);
 void q6apm_graph_slot_close(struct q6apm_graph *graph, int dir);
+/* VCPM per-subgraph persistent calibration */
+int q6apm_map_cal_region(struct q6apm *apm, unsigned int slot, u64 dsp_addr,
+			 size_t sz, uint32_t *handle);
+int q6apm_unmap_cal_region(struct q6apm *apm, unsigned int slot, uint32_t handle);
+int q6apm_voice_cal_register(struct q6apm_graph *graph, long long sid);
+void q6apm_voice_cal_deregister(struct q6apm_graph *graph);
 #endif /* __APM_GRAPH_ */

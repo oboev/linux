@@ -356,6 +356,88 @@ static int __q6apm_map_memory_fixed_region(struct device *dev, unsigned int grap
 	return q6apm_send_cmd_sync(apm, pkt, APM_CMD_RSP_SHARED_MEM_MAP_REGIONS);
 }
 
+/*
+ * A dedicated mapping for one VCPM persistent-calibration table. It is neither
+ * a graph data buffer nor a position buffer, so it carries its own token type
+ * and slot and its handle is returned to the caller rather than stored on a
+ * graph: two tables can be live at once, and each must be unmapped against its
+ * own handle.
+ */
+int q6apm_map_cal_region(struct q6apm *apm, unsigned int slot, u64 dsp_addr,
+			 size_t sz, uint32_t *handle)
+{
+	struct apm_shared_map_region_payload *mregions;
+	struct apm_cmd_shared_mem_map_regions *cmd;
+	int payload_size = sizeof(*cmd) + sizeof(*mregions);
+	uint32_t token;
+	void *p;
+	int ret;
+
+	if (slot >= Q6APM_VCAL_MAX_TABLES)
+		return -EINVAL;
+
+	token = APM_MMAP_TOKEN_MAP_TYPE_CAL |
+		(slot ? APM_MMAP_TOKEN_CAL_SLOT : 0);
+
+	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(payload_size,
+					APM_CMD_SHARED_MEM_MAP_REGIONS, token);
+	if (IS_ERR(pkt))
+		return PTR_ERR(pkt);
+
+	p = (void *)pkt + GPR_HDR_SIZE;
+	cmd = p;
+	cmd->mem_pool_id = APM_MEMORY_MAP_SHMEM8_4K_POOL;
+	cmd->num_regions = 1;
+	cmd->property_flag = 0x0;
+
+	mregions = p + sizeof(*cmd);
+	mregions->shm_addr_lsw = lower_32_bits(dsp_addr);
+	mregions->shm_addr_msw = upper_32_bits(dsp_addr);
+	mregions->mem_size_bytes = ALIGN(sz, 4096);
+
+	apm->vcal.tbl[slot].mem_map_handle = 0;
+	ret = q6apm_send_cmd_sync(apm, pkt, APM_CMD_RSP_SHARED_MEM_MAP_REGIONS);
+	if (ret)
+		return ret;
+	if (!apm->vcal.tbl[slot].mem_map_handle)
+		return -ENODEV;
+
+	*handle = apm->vcal.tbl[slot].mem_map_handle;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(q6apm_map_cal_region);
+
+int q6apm_unmap_cal_region(struct q6apm *apm, unsigned int slot, uint32_t handle)
+{
+	struct apm_cmd_shared_mem_unmap_regions *cmd;
+	uint32_t token;
+	int ret;
+
+	if (slot >= Q6APM_VCAL_MAX_TABLES || !handle)
+		return -EINVAL;
+
+	/*
+	 * The map type has to survive into the response: the shared unmap
+	 * handler resolves an ordinary token through the graph idr, which a
+	 * calibration mapping is not in.
+	 */
+	token = APM_MMAP_TOKEN_MAP_TYPE_CAL |
+		(slot ? APM_MMAP_TOKEN_CAL_SLOT : 0);
+
+	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(sizeof(*cmd),
+					APM_CMD_SHARED_MEM_UNMAP_REGIONS, token);
+	if (IS_ERR(pkt))
+		return PTR_ERR(pkt);
+
+	cmd = (void *)pkt + GPR_HDR_SIZE;
+	cmd->mem_map_handle = handle;
+
+	ret = q6apm_send_cmd_sync(apm, pkt, APM_CMD_SHARED_MEM_UNMAP_REGIONS);
+	apm->vcal.tbl[slot].mem_map_handle = 0;
+	return ret;
+}
+EXPORT_SYMBOL_GPL(q6apm_unmap_cal_region);
+
 int q6apm_map_pos_buffer(struct device *dev, unsigned int graph_id, phys_addr_t phys, size_t sz)
 {
 	return __q6apm_map_memory_fixed_region(dev, graph_id, phys, sz, true);
@@ -745,6 +827,27 @@ static int graph_callback(const struct gpr_resp_pkt *data, void *priv, int op)
 		case DATA_CMD_WR_SH_MEM_EP_MEDIA_FORMAT:
 		case APM_CMD_REGISTER_MODULE_EVENTS:
 		case APM_CMD_SET_CFG:
+		case APM_CMD_REGISTER_CFG:
+		case APM_CMD_DEREGISTER_CFG:
+			if (result->opcode == APM_CMD_REGISTER_CFG ||
+			    result->opcode == APM_CMD_DEREGISTER_CFG) {
+				struct q6apm_vcal *vc = &graph->apm->vcal;
+				unsigned int i;
+
+				/*
+				 * Keep the DSP's own status word beside the
+				 * wrapper's return code: a timeout has no
+				 * status at all and must never be reported as
+				 * a refusal.
+				 */
+				for (i = 0; i < Q6APM_VCAL_MAX_TABLES; i++) {
+					if (!vc->tbl[i].send_called)
+						continue;
+					vc->tbl[i].acknowledged_opcode = result->opcode;
+					vc->tbl[i].raw_dsp_status = result->status;
+					vc->tbl[i].raw_dsp_status_valid = true;
+				}
+			}
 			graph->result.opcode = result->opcode;
 			graph->result.status = result->status;
 			if (result->status)
@@ -1317,6 +1420,7 @@ static int apm_probe(gpr_device_t *gdev)
 	mutex_init(&apm->voice_lock);
 	mutex_init(&apm->slot_lock);
 	INIT_LIST_HEAD(&apm->slot_list);
+	mutex_init(&apm->vcal.lock);
 	apm->dev = dev;
 	apm->gdev = gdev;
 	init_waitqueue_head(&apm->wait);
@@ -1400,6 +1504,15 @@ static int apm_callback(const struct gpr_resp_pkt *data, void *priv, int op)
 			wake_up(&apm->wait);
 			break;
 		case APM_CMD_SHARED_MEM_UNMAP_REGIONS:
+			if (hdr->token & APM_MMAP_TOKEN_MAP_TYPE_CAL) {
+				unsigned int slot = !!(hdr->token & APM_MMAP_TOKEN_CAL_SLOT);
+
+				apm->vcal.tbl[slot].mem_map_handle = 0;
+				apm->result.opcode = result->opcode;
+				apm->result.status = result->status;
+				wake_up(&apm->wait);
+				break;
+			}
 			apm->result.opcode = hdr->opcode;
 			apm->result.status = 0;
 			rsp = data->payload;
@@ -1421,6 +1534,13 @@ static int apm_callback(const struct gpr_resp_pkt *data, void *priv, int op)
 		apm->result.opcode = hdr->opcode;
 		apm->result.status = 0;
 		rsp = data->payload;
+		if (hdr->token & APM_MMAP_TOKEN_MAP_TYPE_CAL) {
+			unsigned int slot = !!(hdr->token & APM_MMAP_TOKEN_CAL_SLOT);
+
+			apm->vcal.tbl[slot].mem_map_handle = rsp->mem_map_handle;
+			wake_up(&apm->wait);
+			break;
+		}
 		graph_id = hdr->token & APM_MMAP_TOKEN_GID_MASK;
 		is_pos_buf = hdr->token & APM_MMAP_TOKEN_MAP_TYPE_POS_BUF;
 

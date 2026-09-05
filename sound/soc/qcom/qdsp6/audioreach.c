@@ -2067,23 +2067,20 @@ EXPORT_SYMBOL_GPL(audioreach_set_media_format);
  * q6apm_graph_media_format_pcm(); a hostless voice graph never runs that walk.
  */
 /*
- * The transmit voice graph - the one holding MAILBOX_TX - feeds
- * the vocoder, and the vocoder takes the network's rate, 16 kHz mono for an
- * AMR-WB call, not the PCM's. With its MFCs at the PCM's 48 kHz the encoder
- * refused its input ("unsupported sampling rate(48000)") and the chain after
- * the sample slip never started. The receive graph keeps the PCM format: its
- * MFCs convert the decoder's 16 kHz upward and it is audible.
+ * The transmit voice graph - the one holding MAILBOX_TX - feeds the vocoder,
+ * and the vocoder takes the network's rate, not the PCM's: 8 kHz for a
+ * narrowband call, 16 kHz for AMR-WB. That rate is the modem's to name, and
+ * it does, through VCPM's calibration keys; the MFC formats that follow it
+ * are in the persistent calibration q6apm-vcpm-cal.c registers for the
+ * transmit subgraphs. So the AP writes no format to a transmit MFC at all:
+ * a fixed rate here is wrong for every call but one class. The receive
+ * graph keeps the PCM format: its MFCs convert the decoder's output upward
+ * and it is audible.
  */
-#define AR_VOICE_TX_VOCODER_RATE	16000
-#define AR_VOICE_TX_VOCODER_BITS	16
-#define AR_VOICE_TX_VOCODER_CHANNELS	1
-
 int audioreach_voice_media_format(struct q6apm_graph *graph,
 				  struct audioreach_module_config *cfg)
 {
 	struct audioreach_graph_info *info = graph->info;
-	const struct audioreach_module_config *mfc_cfg = cfg;
-	struct audioreach_module_config tx_cfg;
 	struct audioreach_container *container;
 	struct audioreach_sub_graph *sgs;
 	struct audioreach_module *module;
@@ -2092,28 +2089,19 @@ int audioreach_voice_media_format(struct q6apm_graph *graph,
 	int ret;
 
 	tx = audioreach_count_module(info, MODULE_ID_MAILBOX_TX, &mb_tx) > 0;
-	if (tx) {
-		tx_cfg = *cfg;
-		tx_cfg.sample_rate = AR_VOICE_TX_VOCODER_RATE;
-		tx_cfg.bit_width = AR_VOICE_TX_VOCODER_BITS;
-		tx_cfg.bits_per_sample = AR_VOICE_TX_VOCODER_BITS;
-		tx_cfg.num_channels = AR_VOICE_TX_VOCODER_CHANNELS;
-		audioreach_set_default_channel_mapping(tx_cfg.channel_map,
-						       AR_VOICE_TX_VOCODER_CHANNELS);
-		mfc_cfg = &tx_cfg;
-	}
 
 	list_for_each_entry(sgs, &info->sg_list, node) {
 		list_for_each_entry(container, &sgs->container_list, node) {
 			list_for_each_entry(module, &container->modules_list, node) {
 				switch (module->module_id) {
 				case MODULE_ID_MFC:
-					if (tx)
-						dev_dbg(graph->apm->dev, "voice TX MFC 0x%x -> %u Hz %u ch %u bit\n",
-							 module->instance_id, mfc_cfg->sample_rate,
-							 mfc_cfg->num_channels, mfc_cfg->bit_width);
+					if (tx) {
+						dev_dbg(graph->apm->dev, "voice TX MFC 0x%x: format left to VCPM's calibration\n",
+							module->instance_id);
+						continue;
+					}
 					ret = audioreach_mfc_set_media_format(graph, module,
-									      mfc_cfg);
+									      cfg);
 					break;
 				case MODULE_ID_DATA_LOGGING:
 					ret = audioreach_set_media_format(graph, module, cfg);

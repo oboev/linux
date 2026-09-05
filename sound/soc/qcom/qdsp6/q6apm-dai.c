@@ -491,6 +491,16 @@ static int q6apm_dai_open(struct snd_soc_component *component,
 			goto err_close;
 		runtime->hw = q6apm_dai_hardware_voice;
 		runtime->private_data = prtd;
+		/*
+		 * The vendor registers per-subgraph persistent calibration here
+		 * - immediately after this graph's GRAPH_OPEN, before its
+		 * session config, media format, prepare or start
+		 * (gsl_graph_send_persist_cal()). The tables target the TX
+		 * subgraphs, so only the TX half registers, and only once both
+		 * halves are open.
+		 */
+		if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
+			q6apm_voice_cal_register(prtd->graph, pdata->sid);
 		return 0;
 	}
 
@@ -567,8 +577,12 @@ static int q6apm_dai_close(struct snd_soc_component *component,
 			q6apm_free_fragments(prtd->graph, substream->stream);
 	}
 
-	if (prtd->voice)
+	if (prtd->voice) {
+		/* stopped, port still live, graph not yet closed */
+		if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
+			q6apm_voice_cal_deregister(prtd->graph);
 		q6apm_voice_release(component->dev);
+	}
 
 	q6apm_graph_close(prtd->graph);
 	prtd->graph = NULL;
